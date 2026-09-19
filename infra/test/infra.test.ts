@@ -452,7 +452,7 @@ test('Guest-first passwordless auth: CUSTOM_AUTH challenge triggers wired to the
           Resource: '*',
           Condition: {
             StringEquals: {
-              'ses:FromAddress': 'playxcafesupport@gmail.com',
+              'ses:FromAddress': 'bookings@playxcafe.com',
             },
           },
         }),

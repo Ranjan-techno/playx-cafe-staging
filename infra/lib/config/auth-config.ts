@@ -31,6 +31,8 @@ export interface AuthConfig {
   sesFromEmail: string;
   /** Display name shown alongside sesFromEmail in the "From" header. */
   sesFromName: string;
+  /** Reply-To address on the OTP email (a real, monitored mailbox). Not an SES identity. */
+  sesReplyToEmail: string;
   /** AWS region the SES identity lives in / sends from. */
   sesRegion: string;
 }
@@ -44,8 +46,9 @@ export const authConfigs: Record<'dev' | 'prod', AuthConfig> = {
     passwordRequireSymbols: false,
     deletionProtection: false,
     removalPolicy: cdk.RemovalPolicy.DESTROY,
-    sesFromEmail: 'playxcafesupport@gmail.com',
+    sesFromEmail: 'bookings@playxcafe.com',
     sesFromName: 'Play X Cafe',
+    sesReplyToEmail: 'bookings@playxcafe.com',
     sesRegion: 'ap-south-1',
   },
   prod: {
@@ -59,8 +62,9 @@ export const authConfigs: Record<'dev' | 'prod', AuthConfig> = {
     passwordRequireSymbols: false,
     deletionProtection: true,
     removalPolicy: cdk.RemovalPolicy.RETAIN,
-    sesFromEmail: 'playxcafesupport@gmail.com',
+    sesFromEmail: 'bookings@playxcafe.com',
     sesFromName: 'Play X Cafe',
+    sesReplyToEmail: 'bookings@playxcafe.com',
     sesRegion: 'ap-south-1',
   },
 };
