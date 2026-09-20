@@ -163,7 +163,9 @@ export class AuthConstruct extends Construct {
       email: cognito.UserPoolEmail.withSES({
         fromEmail: authConfig.sesFromEmail,
         fromName: authConfig.sesFromName,
+        replyTo: authConfig.sesReplyToEmail,
         sesRegion: authConfig.sesRegion,
+        sesVerifiedDomain: authConfig.sesVerifiedDomain,
       }),
 
       // Wires up the three CUSTOM_AUTH triggers created above. This updates the existing User

@@ -35,6 +35,9 @@ export interface AuthConfig {
   sesReplyToEmail: string;
   /** AWS region the SES identity lives in / sends from. */
   sesRegion: string;
+  /** Verified SES DOMAIN identity Cognito sends through (its SourceArn becomes
+   *  identity/<domain>). The individual sesFromEmail address is not a separate SES identity. */
+  sesVerifiedDomain: string;
 }
 
 export const authConfigs: Record<'dev' | 'prod', AuthConfig> = {
@@ -50,6 +53,7 @@ export const authConfigs: Record<'dev' | 'prod', AuthConfig> = {
     sesFromName: 'Play X Cafe',
     sesReplyToEmail: 'bookings@playxcafe.com',
     sesRegion: 'ap-south-1',
+    sesVerifiedDomain: 'playxcafe.com',
   },
   prod: {
     // TODO: revisit before a prod pool exists — deletionProtection true, removalPolicy RETAIN
@@ -66,5 +70,6 @@ export const authConfigs: Record<'dev' | 'prod', AuthConfig> = {
     sesFromName: 'Play X Cafe',
     sesReplyToEmail: 'bookings@playxcafe.com',
     sesRegion: 'ap-south-1',
+    sesVerifiedDomain: 'playxcafe.com',
   },
 };

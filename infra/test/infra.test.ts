@@ -401,6 +401,19 @@ test('Guest-first passwordless auth: CUSTOM_AUTH challenge triggers wired to the
     }),
   });
 
+  // Cognito sends through the verified SES DOMAIN identity (playxcafe.com), not a separate
+  // bookings@playxcafe.com email identity, which is not verified in SES.
+  const pools = template.findResources('AWS::Cognito::UserPool');
+  const emailConfig = Object.values(pools)[0].Properties.EmailConfiguration;
+  expect(emailConfig.From).toBe('Play X Cafe <bookings@playxcafe.com>');
+  expect(emailConfig.ReplyToEmailAddress).toBe('bookings@playxcafe.com');
+  expect(emailConfig.EmailSendingAccount).toBe('DEVELOPER');
+  const sourceArn = JSON.stringify(emailConfig.SourceArn);
+  expect(sourceArn).toContain(':ses:ap-south-1:');
+  expect(sourceArn).toContain('AWS::AccountId');
+  expect(sourceArn).toContain(':identity/playxcafe.com');
+  expect(sourceArn).not.toContain('identity/bookings@playxcafe.com');
+
   // Play X is fully passwordless from launch: EMAIL_OTP is an allowed first factor at the User
   // Pool level (this is what lets auth-start.ts's AdminCreateUser provision a brand-new customer
   // with no TemporaryPassword at all — see constructs/auth.ts's signInPolicy comment for the AWS
