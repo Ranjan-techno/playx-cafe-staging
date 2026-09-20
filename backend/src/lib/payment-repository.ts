@@ -269,3 +269,47 @@ export async function markPaymentPending(db: DbClient, paymentId: string): Promi
     paymentId,
   ]);
 }
+
+export interface CustomerBookingRow {
+  id: string;
+  booking_number: number;
+  status: string;
+  /** products.name — a display line for the provider's dashboard, never a pricing input. */
+  product_name: string;
+}
+
+/** Ownership check AND read in one statement: the booking is returned only if bookings.cognito_sub
+ *  equals the caller's verified JWT `sub`. The caller's identity is never taken from request data;
+ *  a booking that exists but belongs to someone else is indistinguishable from one that doesn't
+ *  exist (both return null). No lock — start-payment.ts takes its own booking lock afterwards. */
+export async function findCustomerBooking(
+  db: DbClient,
+  bookingId: string,
+  cognitoSub: string,
+): Promise<CustomerBookingRow | null> {
+  const { rows } = await db.query<CustomerBookingRow>(
+    `SELECT b.id, b.booking_number, b.status, p.name AS product_name
+     FROM bookings b
+     JOIN products p ON p.id = b.product_id
+     WHERE b.id = $1 AND b.cognito_sub = $2`,
+    [bookingId, cognitoSub],
+  );
+  return rows[0] ?? null;
+}
+
+/** Latest expiry among the booking's live HOLD allocations (null when it has none — confirmed,
+ *  released or never allocated). `hold_expired` uses the database clock, like every other
+ *  availability/hold check. */
+export async function getBookingHoldState(
+  db: DbClient,
+  bookingId: string,
+): Promise<{ holdExpiresAt: Date | null; holdExpired: boolean }> {
+  const { rows } = await db.query<{ hold_expires_at: Date | null; hold_expired: boolean | null }>(
+    `SELECT max(hold_expires_at) AS hold_expires_at, COALESCE(bool_and(hold_expires_at <= now()), false) AS hold_expired
+     FROM booking_allocations
+     WHERE booking_id = $1 AND allocation_status = 'hold'`,
+    [bookingId],
+  );
+  const row = rows[0];
+  return { holdExpiresAt: row?.hold_expires_at ?? null, holdExpired: row?.hold_expired === true };
+}

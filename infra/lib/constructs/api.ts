@@ -11,6 +11,7 @@ import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { ApiConfig } from '../config/api-config';
+import { PaymentConfig } from '../config/payment-config';
 
 export interface ApiConstructProps {
   apiConfig: ApiConfig;
@@ -38,6 +39,14 @@ export interface ApiConstructProps {
   adminPaymentsFunctionName: string;
   adminSimulatorsFunctionName: string;
   adminBookingStatusFunctionName: string;
+
+  /** PhonePe payments (Phase 2): full resource names for the two customer payment Lambdas. */
+  paymentStartFunctionName: string;
+  paymentStatusFunctionName: string;
+  paymentConfig: PaymentConfig;
+  /** Comma-separated Cognito subs/verified emails allowed to start SANDBOX payments. Empty fails
+   *  closed (nobody may start one) — see config/payment-config.ts. */
+  phonepeSandboxTesters: string;
 
   /** Story 2.1 VPC — the products/booking Lambdas need this to reach the Story 2.2 database. */
   vpc: ec2.IVpc;
@@ -101,6 +110,8 @@ export class ApiConstruct extends Construct {
   public readonly adminPaymentsFunction: lambdaNodejs.NodejsFunction;
   public readonly adminSimulatorsFunction: lambdaNodejs.NodejsFunction;
   public readonly adminBookingStatusFunction: lambdaNodejs.NodejsFunction;
+  public readonly paymentStartFunction: lambdaNodejs.NodejsFunction;
+  public readonly paymentStatusFunction: lambdaNodejs.NodejsFunction;
 
   constructor(scope: Construct, id: string, props: ApiConstructProps) {
     super(scope, id);
@@ -218,6 +229,62 @@ export class ApiConstruct extends Construct {
       entry: path.join(__dirname, '../../../backend/src/handlers/admin-booking-status.ts'),
     });
     props.databaseSecret.grantRead(this.adminBookingStatusFunction);
+
+    // PhonePe payments (Phase 2): the ONLY Lambdas placed in the PRIVATE_WITH_EGRESS subnets (NAT
+    // route out to PhonePe over HTTPS). They still use the shared Story 2.2 Lambda security group,
+    // so the DB security group's 5432-from-lambda-sg rule keeps working, and reach RDS over the
+    // VPC-local route. Every other Lambda stays exactly where it was.
+    //
+    // PhonePe credentials: an EXISTING Secrets Manager secret, referenced by name only (CDK never
+    // creates or reads it). The role gets secretsmanager:GetSecretValue on that one secret — no
+    // wildcard, no DescribeSecret — and ONLY these two functions get it. The "-??????" is the
+    // random 6-character suffix Secrets Manager appends to every secret ARN.
+    const phonepeSecretArn = cdk.Stack.of(this).formatArn({
+      service: 'secretsmanager',
+      resource: 'secret',
+      resourceName: `${props.paymentConfig.phonepeSecretName}-??????`,
+      arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+    });
+    const grantPhonePeSecret = (fn: lambdaNodejs.NodejsFunction): void => {
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({ actions: ['secretsmanager:GetSecretValue'], resources: [phonepeSecretArn] }),
+      );
+    };
+    const paymentFunctionDefaults = {
+      ...dbFunctionDefaults,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      // Provider HTTP calls happen here; API Gateway HTTP APIs cut off at 30s regardless.
+      timeout: cdk.Duration.seconds(25),
+      memorySize: 512,
+    };
+    const phonepeCommonEnv = {
+      DB_SECRET_ARN: props.databaseSecret.secretArn,
+      PHONEPE_SECRET_NAME: props.paymentConfig.phonepeSecretName,
+      PHONEPE_ENVIRONMENT: props.paymentConfig.phonepeEnvironment,
+    };
+
+    this.paymentStartFunction = new lambdaNodejs.NodejsFunction(this, 'PaymentStartFunction', {
+      ...paymentFunctionDefaults,
+      functionName: props.paymentStartFunctionName,
+      entry: path.join(__dirname, '../../../backend/src/handlers/payment-start.ts'),
+      environment: {
+        ...phonepeCommonEnv,
+        PHONEPE_SANDBOX_TESTERS: props.phonepeSandboxTesters,
+        PAYMENT_CHECKOUT_HOLD_MINUTES: String(props.paymentConfig.checkoutHoldMinutes),
+        PAYMENT_RETURN_URL: props.paymentConfig.returnUrl,
+      },
+    });
+    props.databaseSecret.grantRead(this.paymentStartFunction);
+    grantPhonePeSecret(this.paymentStartFunction);
+
+    this.paymentStatusFunction = new lambdaNodejs.NodejsFunction(this, 'PaymentStatusFunction', {
+      ...paymentFunctionDefaults,
+      functionName: props.paymentStatusFunctionName,
+      entry: path.join(__dirname, '../../../backend/src/handlers/payment-status.ts'),
+      environment: phonepeCommonEnv,
+    });
+    props.databaseSecret.grantRead(this.paymentStatusFunction);
+    grantPhonePeSecret(this.paymentStatusFunction);
 
     // Not VPC-attached, same as healthFunction: these only call Cognito's regional Admin* APIs,
     // never the database.
@@ -372,6 +439,23 @@ export class ApiConstruct extends Construct {
       path: '/admin/simulators',
       methods: [apigwv2.HttpMethod.GET],
       integration: new apigwv2Integrations.HttpLambdaIntegration('AdminSimulatorsIntegration', this.adminSimulatorsFunction),
+      authorizer: cognitoAuthorizer,
+    });
+
+    // PhonePe payments (Phase 2). Both behind the Cognito JWT authorizer; each handler additionally
+    // enforces booking ownership (and, for start, the SANDBOX tester allowlist). No webhook route
+    // yet — that is a later phase.
+    this.httpApi.addRoutes({
+      path: '/payments/start',
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration('PaymentStartIntegration', this.paymentStartFunction),
+      authorizer: cognitoAuthorizer,
+    });
+
+    this.httpApi.addRoutes({
+      path: '/payments/{bookingId}/status',
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration('PaymentStatusIntegration', this.paymentStatusFunction),
       authorizer: cognitoAuthorizer,
     });
 

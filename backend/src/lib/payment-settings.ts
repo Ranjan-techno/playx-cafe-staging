@@ -21,3 +21,23 @@ export function getCheckoutHoldMinutes(env: NodeJS.ProcessEnv = process.env): nu
   }
   return value;
 }
+
+/** The customer return page PhonePe redirects to after checkout (PAYMENT_RETURN_URL). Must be an
+ *  https URL; unset/blank means "no redirect configured". The redirect is UX only — it is never
+ *  payment proof (GET /payments/{id}/status reconciles with the provider). */
+export function getPaymentReturnUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.PAYMENT_RETURN_URL?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('PAYMENT_RETURN_URL must be a valid URL');
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error('PAYMENT_RETURN_URL must be an https URL');
+  }
+  return url.toString();
+}

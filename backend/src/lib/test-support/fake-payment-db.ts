@@ -25,6 +25,10 @@ export interface FakeBookingRow {
   racers: number;
   scheduled_start_at: Date;
   scheduled_end_at: Date;
+  /** Owner (JWT sub) and display fields, used only by the customer payment endpoints' lookups. */
+  cognito_sub?: string;
+  booking_number?: number;
+  product_name?: string;
 }
 
 export interface FakeAllocationRow {
@@ -115,6 +119,9 @@ export function seedBooking(
     end?: Date;
     /** Seed the allocations as 'confirmed' rather than 'hold'. */
     allocationStatus?: 'hold' | 'confirmed';
+    cognitoSub?: string;
+    bookingNumber?: number;
+    productName?: string;
   },
 ): FakeBookingRow {
   const start = input.start ?? new Date(Date.now() + 24 * 60 * 60_000);
@@ -126,6 +133,9 @@ export function seedBooking(
     racers: input.racers ?? 1,
     scheduled_start_at: start,
     scheduled_end_at: input.end ?? new Date(start.getTime() + 30 * 60_000),
+    cognito_sub: input.cognitoSub,
+    booking_number: input.bookingNumber ?? 1001,
+    product_name: input.productName ?? 'Solo Static 30 min',
   };
   store.bookings.push(booking);
 
@@ -248,6 +258,33 @@ export function createFakePaymentDbClient(store: FakePaymentDbStore): FakePaymen
       journal = [];
       releaseLocks();
       return { rows: [] };
+    }
+
+    // findCustomerBooking: ownership is part of the WHERE clause (b.cognito_sub = $2).
+    if (/^SELECT b\.id, b\.booking_number, b\.status, p\.name AS product_name/i.test(sql)) {
+      const [id, sub] = params as [string, string];
+      const row = store.bookings.find((b) => b.id === id && b.cognito_sub === sub);
+      return {
+        rows: (row
+          ? [{ id: row.id, booking_number: row.booking_number, status: row.status, product_name: row.product_name }]
+          : []) as unknown as T[],
+      };
+    }
+
+    // getBookingHoldState
+    if (/^SELECT max\(hold_expires_at\)/i.test(sql)) {
+      const [bookingId] = params as [string];
+      const now = new Date();
+      const holds = store.allocations.filter((a) => a.booking_id === bookingId && a.allocation_status === 'hold');
+      const times = holds.map((a) => (a.hold_expires_at as Date).getTime());
+      return {
+        rows: [
+          {
+            hold_expires_at: holds.length ? new Date(Math.max(...times)) : null,
+            hold_expired: holds.length > 0 && holds.every((a) => (a.hold_expires_at as Date) <= now),
+          },
+        ] as unknown as T[],
+      };
     }
 
     // lockBookingForPayment: SELECT id, status, price_inr FROM bookings WHERE id = $1 FOR UPDATE

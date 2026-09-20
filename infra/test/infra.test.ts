@@ -1,9 +1,10 @@
+import assert from 'node:assert/strict';
 import * as cdk from 'aws-cdk-lib/core';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import { InfraStack } from '../lib/infra-stack';
 import { environments } from '../lib/config/environment-config';
 
-test('Story 2.1: VPC created with isolated-only subnets and no NAT Gateway', () => {
+test('Story 2.1 (+ payments egress): VPC keeps its isolated subnets and adds NAT-backed egress subnets', () => {
   const app = new cdk.App();
   const stack = new InfraStack(app, 'TestInfraStack', {
     envConfig: environments.dev,
@@ -16,10 +17,10 @@ test('Story 2.1: VPC created with isolated-only subnets and no NAT Gateway', () 
     CidrBlock: '10.20.0.0/16',
   });
 
-  // 2 AZs, PRIVATE_ISOLATED only.
-  template.resourceCountIs('AWS::EC2::Subnet', 2);
+  // 2 AZs x (private-isolated [original] + public [NAT host only] + private-egress [payments]).
+  template.resourceCountIs('AWS::EC2::Subnet', 6);
 
-  // No NAT Gateway. Exactly seventeen Lambdas: Story 2.3's migration function, Story 2.5's
+  // Exactly ONE NAT Gateway (MVP cost control, payments egress only). Exactly nineteen Lambdas: Story 2.3's migration function, Story 2.5's
   // health-check function, Story 2.6's products/create-booking/bookings-me functions, guest-
   // first passwordless auth's auth-start/auth-verify functions, its three Cognito CUSTOM_AUTH
   // triggers (DefineAuthChallenge/CreateAuthChallenge/VerifyAuthChallengeResponse), Phase 2's
@@ -28,8 +29,8 @@ test('Story 2.1: VPC created with isolated-only subnets and no NAT Gateway', () 
   // not the restrictDefaultSecurityGroup feature flag's custom-resource Lambda, which stays
   // guarded against separately (that flag is explicitly disabled for this VPC — see
   // constructs/network.ts).
-  template.resourceCountIs('AWS::EC2::NatGateway', 0);
-  template.resourceCountIs('AWS::Lambda::Function', 17);
+  template.resourceCountIs('AWS::EC2::NatGateway', 1);
+  template.resourceCountIs('AWS::Lambda::Function', 19);
 });
 
 test('Story 2.2: RDS PostgreSQL created private, isolated, and encrypted, with a locked-down SG pair', () => {
@@ -91,12 +92,12 @@ test('Story 2.3: migration Lambda deployed in isolated subnets with no public tr
   });
   const template = Template.fromStack(stack);
 
-  // Seventeen Lambda functions exist in the stack (this one, Story 2.5's health-check function,
+  // Nineteen Lambda functions exist in the stack (this one, Story 2.5's health-check function,
   // Story 2.6's products/create-booking/bookings-me functions, guest-first passwordless auth's
   // auth-start/auth-verify functions, its three CUSTOM_AUTH triggers, Phase 2's availability
   // function, and Phase 3B's six admin functions — see below), but health/auth-start/auth-verify/
   // the three triggers are the six of the seventeen that do NOT sit in the VPC.
-  template.resourceCountIs('AWS::Lambda::Function', 17);
+  template.resourceCountIs('AWS::Lambda::Function', 19);
   template.hasResourceProperties('AWS::Lambda::Function', {
     FunctionName: 'playx-dev-migrate',
     Runtime: 'nodejs22.x',
@@ -272,13 +273,13 @@ test('Story 2.6: authenticated booking APIs — Cognito JWT authorizer on POST /
     IdentitySource: ['$request.header.Authorization'],
   });
 
-  // Thirteen routes total: GET /health (Story 2.5), GET /products, POST /bookings, and
+  // Fifteen routes total (incl. PhonePe Phase 2's two payment routes, checked below): GET /health (Story 2.5), GET /products, POST /bookings, and
   // GET /bookings/me (this story), POST /auth/start and POST /auth/verify (guest-first
   // passwordless auth, checked separately below), GET /availability (Phase 2, checked separately
   // further below), and Phase 3B's six admin routes (checked separately further below too).
-  // Thirteen integrations, one per route.
-  template.resourceCountIs('AWS::ApiGatewayV2::Route', 13);
-  template.resourceCountIs('AWS::ApiGatewayV2::Integration', 13);
+  // Fifteen integrations, one per route.
+  template.resourceCountIs('AWS::ApiGatewayV2::Route', 15);
+  template.resourceCountIs('AWS::ApiGatewayV2::Integration', 15);
 
   // GET /products is public: no authorizer attached (CloudFormation emits AuthorizationType:
   // 'NONE' explicitly for an unauthenticated route, rather than omitting the property).
@@ -607,6 +608,209 @@ test('Phase 3B: PLAY X ADMIN — all six admin Lambdas are VPC-attached with dat
           Effect: 'Allow',
         }),
       ]),
+    }),
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PhonePe Phase 2: payment Lambdas, NAT egress, PhonePe secret IAM, payment routes.
+// ---------------------------------------------------------------------------------------------
+
+type Json = Record<string, any>;
+
+function synth(context?: Record<string, string>): { template: Template; json: Json } {
+  const app = new cdk.App(context ? { context } : undefined);
+  const stack = new InfraStack(app, 'TestInfraStack', {
+    envConfig: environments.dev,
+    env: { region: 'ap-south-1' },
+  });
+  const template = Template.fromStack(stack);
+  return { template, json: template.toJSON() };
+}
+
+const PAYMENT_FUNCTIONS = ['playx-dev-payment-start', 'playx-dev-payment-status'];
+
+function lambdaEntries(json: Json): [string, Json][] {
+  return Object.entries<Json>(json.Resources).filter(([, r]) => r.Type === 'AWS::Lambda::Function');
+}
+
+/** Every IAM statement attached (via IAM::Policy) to the role of the named Lambda. */
+function statementsFor(json: Json, functionName: string): Json[] {
+  const fn = lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === functionName);
+  assert.ok(fn, `Lambda ${functionName} exists`);
+  const roleId = fn[1].Properties.Role['Fn::GetAtt'][0];
+  return Object.values<Json>(json.Resources)
+    .filter((r) => r.Type === 'AWS::IAM::Policy' && r.Properties.Roles.some((role: Json) => role.Ref === roleId))
+    .flatMap((r) => [r.Properties.PolicyDocument.Statement].flat());
+}
+
+function isPhonePeSecretStatement(statement: Json): boolean {
+  return JSON.stringify(statement.Resource).includes('playx/phonepe/sandbox');
+}
+
+test('PhonePe Phase 2: existing VPC/subnets/RDS/Cognito/API keep their logical IDs and shape (nothing replaced)', () => {
+  const { template, json } = synth();
+  const ids = Object.keys(json.Resources);
+  for (const id of [
+    'NetworkVpc7FB7348F',
+    'NetworkVpcprivateisolatedSubnet1SubnetACC755DD',
+    'NetworkVpcprivateisolatedSubnet2SubnetBCE28083',
+    'DatabaseInstanceAA8A5FDE',
+    'AuthUserPool8115E87F',
+  ]) {
+    assert.ok(ids.includes(id), `${id} still exists under the same logical ID`);
+  }
+  // Same CIDRs as the deployed isolated subnets: the new groups were appended, not interleaved.
+  assert.equal(json.Resources.NetworkVpcprivateisolatedSubnet1SubnetACC755DD.Properties.CidrBlock, '10.20.0.0/24');
+  assert.equal(json.Resources.NetworkVpcprivateisolatedSubnet2SubnetBCE28083.Properties.CidrBlock, '10.20.1.0/24');
+  assert.equal(json.Resources.NetworkVpc7FB7348F.Properties.CidrBlock, '10.20.0.0/16');
+  template.resourceCountIs('AWS::EC2::VPC', 1);
+  template.resourceCountIs('AWS::RDS::DBInstance', 1);
+  template.resourceCountIs('AWS::Cognito::UserPool', 1);
+  template.resourceCountIs('AWS::ApiGatewayV2::Api', 1);
+  // RDS stays isolated: its subnet group is exactly the two original isolated subnets.
+  const subnetGroup = Object.values<Json>(json.Resources).find((r) => r.Type === 'AWS::RDS::DBSubnetGroup');
+  assert.deepEqual(
+    subnetGroup?.Properties.SubnetIds.map((s: Json) => s.Ref).sort(),
+    ['NetworkVpcprivateisolatedSubnet1SubnetACC755DD', 'NetworkVpcprivateisolatedSubnet2SubnetBCE28083'],
+  );
+  // The isolated route tables gained no internet/NAT route.
+  for (const route of Object.values<Json>(json.Resources).filter((r) => r.Type === 'AWS::EC2::Route')) {
+    const table = route.Properties.RouteTableId.Ref as string;
+    assert.ok(!table.includes('privateisolated'), `${table} must stay routeless`);
+  }
+});
+
+test('PhonePe Phase 2: one NAT Gateway in a public subnet; private-egress subnets default-route through it', () => {
+  const { template, json } = synth();
+  template.resourceCountIs('AWS::EC2::NatGateway', 1);
+  template.resourceCountIs('AWS::EC2::InternetGateway', 1);
+  const nat = Object.values<Json>(json.Resources).find((r) => r.Type === 'AWS::EC2::NatGateway');
+  assert.ok(String(nat?.Properties.SubnetId.Ref).includes('public'), 'NAT lives in a public subnet');
+  const natRoutes = Object.entries<Json>(json.Resources).filter(([, r]) => r.Type === 'AWS::EC2::Route' && r.Properties.NatGatewayId);
+  assert.equal(natRoutes.length, 2, 'both private-egress subnets route via the single NAT');
+  for (const [, route] of natRoutes) {
+    assert.equal(route.Properties.DestinationCidrBlock, '0.0.0.0/0');
+    assert.ok(String(route.Properties.RouteTableId.Ref).includes('privateegress'));
+  }
+});
+
+test('PhonePe Phase 2: payment Lambdas use private-with-egress subnets and the shared Lambda security group; all other VPC Lambdas stay isolated', () => {
+  const { json } = synth();
+  const lambdaSg = Object.entries<Json>(json.Resources).find(
+    ([, r]) => r.Type === 'AWS::EC2::SecurityGroup' && r.Properties.GroupName === 'playx-dev-lambda-sg',
+  )?.[0];
+  for (const [, fn] of lambdaEntries(json)) {
+    const vpc = fn.Properties.VpcConfig;
+    if (!vpc) continue;
+    const subnets: string[] = vpc.SubnetIds.map((s: Json) => s.Ref);
+    if (PAYMENT_FUNCTIONS.includes(fn.Properties.FunctionName)) {
+      assert.equal(subnets.length, 2);
+      assert.ok(subnets.every((s) => s.includes('privateegress')), `${fn.Properties.FunctionName} on egress subnets`);
+      assert.deepEqual(vpc.SecurityGroupIds, [{ 'Fn::GetAtt': [lambdaSg, 'GroupId'] }], 'shared lambda-sg => RDS reachable');
+    } else {
+      assert.ok(subnets.every((s) => s.includes('privateisolated')), `${fn.Properties.FunctionName} not moved`);
+    }
+  }
+  for (const name of PAYMENT_FUNCTIONS) {
+    const fn = lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === name)?.[1];
+    assert.equal(fn?.Properties.Timeout, 25);
+    assert.equal(fn?.Properties.Runtime, 'nodejs22.x');
+  }
+});
+
+test('PhonePe Phase 2: ONLY the two payment Lambdas can read the PhonePe secret, with GetSecretValue on that one secret', () => {
+  const { json } = synth();
+  for (const [, fn] of lambdaEntries(json)) {
+    const name = fn.Properties.FunctionName as string;
+    const phonepe = statementsFor(json, name).filter(isPhonePeSecretStatement);
+    if (PAYMENT_FUNCTIONS.includes(name)) {
+      assert.equal(phonepe.length, 1, `${name} has the PhonePe grant`);
+      assert.equal(phonepe[0].Effect, 'Allow');
+      assert.equal(phonepe[0].Action, 'secretsmanager:GetSecretValue', 'GetSecretValue only');
+      const arn = JSON.stringify(phonepe[0].Resource);
+      assert.ok(arn.includes('secret:playx/phonepe/sandbox-??????'), 'scoped to the one secret (name + random suffix)');
+      assert.ok(!arn.includes('"*"') && !arn.includes('secret:*'));
+    } else {
+      assert.equal(phonepe.length, 0, `${name} must NOT be able to read the PhonePe secret`);
+    }
+  }
+  // No stack-wide wildcard grant on Secrets Manager either.
+  for (const r of Object.values<Json>(json.Resources).filter((x) => x.Type === 'AWS::IAM::Policy')) {
+    for (const st of [r.Properties.PolicyDocument.Statement].flat()) {
+      if (JSON.stringify(st.Action).includes('secretsmanager')) {
+        assert.notEqual(st.Resource, '*');
+      }
+    }
+  }
+});
+
+test('PhonePe Phase 2: the PhonePe secret is referenced, never created, and no credential is in the template', () => {
+  const { template, json } = synth();
+  // Still just the RDS credentials secret from Story 2.2.
+  template.resourceCountIs('AWS::SecretsManager::Secret', 1);
+  const text = JSON.stringify(json);
+  assert.ok(!/clientSecret|CLIENT_SECRET|webhookPassword|WEBHOOK/i.test(text));
+});
+
+test('PhonePe Phase 2: payment Lambda environment — config wired, sandbox testers fail closed by default', () => {
+  const { json } = synth();
+  const env = (name: string) =>
+    lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === name)?.[1].Properties.Environment.Variables as Json;
+  const start = env('playx-dev-payment-start');
+  assert.equal(start.PHONEPE_SECRET_NAME, 'playx/phonepe/sandbox');
+  assert.equal(start.PHONEPE_ENVIRONMENT, 'SANDBOX');
+  assert.equal(start.PAYMENT_CHECKOUT_HOLD_MINUTES, '20');
+  assert.equal(start.PAYMENT_RETURN_URL, 'https://staging.playxcafe.com/payment-return.html');
+  assert.equal(start.PHONEPE_SANDBOX_TESTERS, '', 'no tester configured => backend denies every start');
+  const status = env('playx-dev-payment-status');
+  assert.equal(status.PHONEPE_SECRET_NAME, 'playx/phonepe/sandbox');
+  assert.equal(status.PHONEPE_SANDBOX_TESTERS, undefined, 'status does not need the tester list');
+  // No other Lambda gets any PhonePe configuration.
+  for (const [, fn] of lambdaEntries(json)) {
+    if (PAYMENT_FUNCTIONS.includes(fn.Properties.FunctionName)) continue;
+    assert.ok(!JSON.stringify(fn.Properties.Environment ?? {}).includes('PHONEPE'), fn.Properties.FunctionName);
+  }
+});
+
+test('PhonePe Phase 2: sandbox testers come from deploy-time context, trimmed; blank stays empty', () => {
+  const configured = synth({ phonepeSandboxTesters: ' sub-1 , tester@example.com ,, ' });
+  const env = lambdaEntries(configured.json).find(([, r]) => r.Properties.FunctionName === 'playx-dev-payment-start')?.[1].Properties
+    .Environment.Variables;
+  assert.equal(env.PHONEPE_SANDBOX_TESTERS, 'sub-1,tester@example.com');
+  const blank = synth({ phonepeSandboxTesters: '   ' });
+  const blankEnv = lambdaEntries(blank.json).find(([, r]) => r.Properties.FunctionName === 'playx-dev-payment-start')?.[1].Properties
+    .Environment.Variables;
+  assert.equal(blankEnv.PHONEPE_SANDBOX_TESTERS, '');
+});
+
+test('PhonePe Phase 2: POST /payments/start and GET /payments/{bookingId}/status are JWT-protected; no webhook route exists', () => {
+  const { template, json } = synth();
+  const authorizerId = Object.entries<Json>(json.Resources).find(([, r]) => r.Type === 'AWS::ApiGatewayV2::Authorizer')?.[0];
+  for (const routeKey of ['POST /payments/start', 'GET /payments/{bookingId}/status']) {
+    template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
+      RouteKey: routeKey,
+      AuthorizationType: 'JWT',
+      AuthorizerId: { Ref: authorizerId },
+    });
+  }
+  const routeKeys = Object.values<Json>(json.Resources)
+    .filter((r) => r.Type === 'AWS::ApiGatewayV2::Route')
+    .map((r) => r.Properties.RouteKey as string);
+  assert.ok(routeKeys.every((k) => !/webhook|callback/i.test(k)), 'no webhook/callback route yet');
+  assert.equal(routeKeys.filter((k) => /^\w+ \/payments/.test(k)).length, 2);
+  // CORS unchanged: same origins, same methods/headers.
+  template.hasResourceProperties('AWS::ApiGatewayV2::Api', {
+    CorsConfiguration: Match.objectLike({
+      AllowMethods: ['GET', 'POST', 'PATCH'],
+      AllowHeaders: ['Content-Type', 'Authorization'],
+      AllowOrigins: [
+        'https://ranjan-techno.github.io',
+        'http://localhost:8000',
+        'https://staging.playxcafe.com',
+        'https://playxcafe.com',
+        'https://www.playxcafe.com',
+      ],
     }),
   });
 });
