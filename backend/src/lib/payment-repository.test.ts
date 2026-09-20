@@ -15,7 +15,7 @@ import {
 import { createFakePaymentDbClient, createFakePaymentDbStore, seedBooking } from './test-support/fake-payment-db';
 
 // "payment record creation/domain model" — direct unit coverage of the repository layer itself,
-// independent of the higher-level create-payment-attempt.ts/confirm-successful-payment.ts flows
+// independent of the higher-level start-payment.ts/confirm-successful-payment.ts flows
 // that compose these functions (covered in their own test files).
 
 test('createPaymentAttempt inserts a row defaulting to "created" with no paid_at', async () => {
@@ -79,7 +79,15 @@ test('markPaymentPaid without a transaction id leaves an existing one untouched 
 test('confirmBookingAllocations moves only HOLD rows to CONFIRMED and clears hold_expires_at', async () => {
   const store = createFakePaymentDbStore();
   const booking = seedBooking(store, { priceInr: '399.00', holdAllocations: 2 });
-  store.allocations.push({ id: 'released-1', booking_id: booking.id, allocation_status: 'released', hold_expires_at: null });
+  store.allocations.push({
+    id: 'released-1',
+    booking_id: booking.id,
+    simulator_id: 'sim-S1',
+    scheduled_start_at: booking.scheduled_start_at,
+    scheduled_end_at: booking.scheduled_end_at,
+    allocation_status: 'released',
+    hold_expires_at: null,
+  });
   const db = createFakePaymentDbClient(store);
 
   await confirmBookingAllocations(db, booking.id);
