@@ -4,7 +4,6 @@ import { confirmSuccessfulPayment } from './confirm-successful-payment';
 import {
   AmountMismatchError,
   BookingAlreadyPaidError,
-  BookingNotConfirmableError,
   CurrencyMismatchError,
   DuplicateProviderTransactionError,
   PaymentAlreadyFinalizedError,
@@ -242,18 +241,20 @@ test('unknown payment: confirming a provider order id with no matching payment r
   );
 });
 
-test('booking no longer confirmable: a successful payment against a cancelled booking is rejected, not silently confirmed', async () => {
+test('booking already cancelled: the payment is recorded PAID and flagged for manual refund; the booking is NOT resurrected', async () => {
   const store = createFakePaymentDbStore();
   const booking = seedBooking(store, { priceInr: '399.00', status: 'cancelled', holdAllocations: 0 });
   const db = createFakePaymentDbClient(store);
   const payment = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'order-cancelled', amountInr: '399.00' });
 
-  await assert.rejects(
-    () => confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: payment.provider_order_id, amountInr: 399.0 }),
-    BookingNotConfirmableError,
-  );
+  const result = await confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: payment.provider_order_id, amountInr: 399.0 });
 
-  assert.equal(store.payments.find((p) => p.id === payment.id)!.payment_status, 'created');
+  assert.equal(result.outcome, 'refund_required');
+  const stored = store.payments.find((p) => p.id === payment.id)!;
+  assert.equal(stored.payment_status, 'paid');
+  assert.equal(stored.metadata?.refundRequired, true);
+  assert.equal(stored.metadata?.reason, 'booking_cancelled');
+  assert.equal(store.bookings.find((b) => b.id === booking.id)!.status, 'cancelled');
 });
 
 test('database transaction rolls back on failure: a mid-transaction error undoes every write already made in that attempt', async () => {

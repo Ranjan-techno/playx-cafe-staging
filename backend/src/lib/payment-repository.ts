@@ -2,7 +2,7 @@
 // `payments` (and the couple of `bookings` columns confirm-successful-payment.ts needs), matching
 // the split allocate-simulators.ts/simulator-allocation.ts already established: this file only
 // issues SQL, with no allocation/confirmation policy of its own — that lives in
-// create-payment-attempt.ts and confirm-successful-payment.ts, which call these.
+// start-payment.ts and confirm-successful-payment.ts, which call these.
 //
 // Reuses allocate-simulators.ts's DbClient — the same minimal `query(text, params)` surface
 // db.ts's getDb() already satisfies, and the same shape lib/test-support/fake-*.ts fakes
@@ -38,6 +38,22 @@ export interface BookingForPaymentRow {
   id: string;
   status: string;
   price_inr: string;
+  /** The booking's own snapshot columns — what secureBookingCapacity() derives the simulator
+   *  requirement and window from (never the current product row). */
+  simulator_type: 'static' | 'motion' | null;
+  racers: number;
+  scheduled_start_at: Date;
+  scheduled_end_at: Date;
+}
+
+export interface AllocationLockRow {
+  id: string;
+  simulator_id: string;
+  allocation_status: 'hold' | 'confirmed' | 'released';
+  hold_expires_at: Date | null;
+  /** Computed by the DATABASE clock (`now()`), the same clock the availability queries use, so
+   *  "expired" means the same thing everywhere. */
+  hold_expired: boolean;
 }
 
 export interface CreatePaymentAttemptInput {
@@ -63,14 +79,15 @@ export async function createPaymentAttempt(db: DbClient, input: CreatePaymentAtt
   return rows[0];
 }
 
-/** Locks a booking row (id, status, price_inr) FOR UPDATE — the "server-controlled expected
- *  amount" both create-payment-attempt.ts and confirm-successful-payment.ts check against is
+/** Locks a booking row (id, status, price_inr + its allocation snapshot columns) FOR UPDATE — the "server-controlled expected
+ *  amount" both start-payment.ts and confirm-successful-payment.ts check against is
  *  always read from here, never from the browser. Returns null if the booking doesn't exist
  *  (defensive only — payments.booking_id is a NOT NULL FK, so this should be unreachable once a
  *  payment row exists). */
 export async function lockBookingForPayment(db: DbClient, bookingId: string): Promise<BookingForPaymentRow | null> {
   const { rows } = await db.query<BookingForPaymentRow>(
-    `SELECT id, status, price_inr FROM bookings WHERE id = $1 FOR UPDATE`,
+    `SELECT id, status, price_inr, simulator_type, racers, scheduled_start_at, scheduled_end_at
+     FROM bookings WHERE id = $1 FOR UPDATE`,
     [bookingId],
   );
   return rows[0] ?? null;
@@ -116,15 +133,89 @@ export async function markPaymentPaid(
   db: DbClient,
   paymentId: string,
   providerTransactionId: string | null,
+  metadataPatch: Record<string, unknown> | null = null,
 ): Promise<void> {
   await db.query(
     `UPDATE payments
      SET payment_status = 'paid',
          provider_transaction_id = COALESCE($2, provider_transaction_id),
+         metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE($3::jsonb, '{}'::jsonb),
          paid_at = now()
      WHERE id = $1`,
-    [paymentId, providerTransactionId],
+    [paymentId, providerTransactionId, metadataPatch],
   );
+}
+
+/** Locks a payment row FOR UPDATE by primary key (used by the second stage of start-payment). */
+export async function lockPaymentById(db: DbClient, paymentId: string): Promise<PaymentRow | null> {
+  const { rows } = await db.query<PaymentRow>(`SELECT * FROM payments WHERE id = $1 FOR UPDATE`, [paymentId]);
+  return rows[0] ?? null;
+}
+
+/** Every payment attempt for a booking, oldest first. Deliberately NOT locked: start-payment holds
+ *  the booking lock, and payment-then-booking is the global lock order (see
+ *  confirm-successful-payment.ts), so taking payment locks after the booking lock could deadlock. */
+export async function listPaymentsForBooking(db: DbClient, bookingId: string): Promise<PaymentRow[]> {
+  const { rows } = await db.query<PaymentRow>(
+    `SELECT * FROM payments WHERE booking_id = $1 ORDER BY created_at, id`,
+    [bookingId],
+  );
+  return rows;
+}
+
+/** Shallow-merges `patch` into payments.metadata (jsonb `||`). */
+export async function mergePaymentMetadata(
+  db: DbClient,
+  paymentId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  await db.query(`UPDATE payments SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [
+    paymentId,
+    patch,
+  ]);
+}
+
+/** Locks this booking's allocation rows (any status), in id order. Part of the fixed lock order:
+ *  payment -> booking -> simulators -> allocations. */
+export async function lockAllocationsForBooking(db: DbClient, bookingId: string): Promise<AllocationLockRow[]> {
+  const { rows } = await db.query<AllocationLockRow>(
+    `SELECT id, simulator_id, allocation_status, hold_expires_at,
+            (allocation_status = 'hold' AND hold_expires_at <= now()) AS hold_expired
+     FROM booking_allocations
+     WHERE booking_id = $1
+     ORDER BY id
+     FOR UPDATE`,
+    [bookingId],
+  );
+  return rows;
+}
+
+/** HOLD -> released for every hold row of the booking (expired or not) — a released row never
+ *  blocks capacity and is never resurrected. */
+export async function releaseHeldAllocations(db: DbClient, bookingId: string): Promise<void> {
+  await db.query(
+    `UPDATE booking_allocations
+     SET allocation_status = 'released', hold_expires_at = NULL
+     WHERE booking_id = $1 AND allocation_status = 'hold'`,
+    [bookingId],
+  );
+}
+
+/** Moves every HOLD row of the booking to a new expiry. */
+export async function setHoldExpiry(db: DbClient, bookingId: string, holdExpiresAt: Date): Promise<void> {
+  await db.query(
+    `UPDATE booking_allocations SET hold_expires_at = $2 WHERE booking_id = $1 AND allocation_status = 'hold'`,
+    [bookingId, holdExpiresAt],
+  );
+}
+
+/** 'pending' -> 'cancelled' — used when a payment succeeded but the booking's capacity is gone. */
+export async function cancelPendingBooking(db: DbClient, bookingId: string): Promise<boolean> {
+  const { rows } = await db.query<{ id: string }>(
+    `UPDATE bookings SET status = 'cancelled' WHERE id = $1 AND status = 'pending' RETURNING id`,
+    [bookingId],
+  );
+  return rows.length > 0;
 }
 
 /** Moves a booking's currently-HOLD allocations to 'confirmed' and clears hold_expires_at — see
@@ -177,4 +268,48 @@ export async function markPaymentPending(db: DbClient, paymentId: string): Promi
   await db.query(`UPDATE payments SET payment_status = 'pending' WHERE id = $1 AND payment_status = 'created'`, [
     paymentId,
   ]);
+}
+
+export interface CustomerBookingRow {
+  id: string;
+  booking_number: number;
+  status: string;
+  /** products.name — a display line for the provider's dashboard, never a pricing input. */
+  product_name: string;
+}
+
+/** Ownership check AND read in one statement: the booking is returned only if bookings.cognito_sub
+ *  equals the caller's verified JWT `sub`. The caller's identity is never taken from request data;
+ *  a booking that exists but belongs to someone else is indistinguishable from one that doesn't
+ *  exist (both return null). No lock — start-payment.ts takes its own booking lock afterwards. */
+export async function findCustomerBooking(
+  db: DbClient,
+  bookingId: string,
+  cognitoSub: string,
+): Promise<CustomerBookingRow | null> {
+  const { rows } = await db.query<CustomerBookingRow>(
+    `SELECT b.id, b.booking_number, b.status, p.name AS product_name
+     FROM bookings b
+     JOIN products p ON p.id = b.product_id
+     WHERE b.id = $1 AND b.cognito_sub = $2`,
+    [bookingId, cognitoSub],
+  );
+  return rows[0] ?? null;
+}
+
+/** Latest expiry among the booking's live HOLD allocations (null when it has none — confirmed,
+ *  released or never allocated). `hold_expired` uses the database clock, like every other
+ *  availability/hold check. */
+export async function getBookingHoldState(
+  db: DbClient,
+  bookingId: string,
+): Promise<{ holdExpiresAt: Date | null; holdExpired: boolean }> {
+  const { rows } = await db.query<{ hold_expires_at: Date | null; hold_expired: boolean | null }>(
+    `SELECT max(hold_expires_at) AS hold_expires_at, COALESCE(bool_and(hold_expires_at <= now()), false) AS hold_expired
+     FROM booking_allocations
+     WHERE booking_id = $1 AND allocation_status = 'hold'`,
+    [bookingId],
+  );
+  const row = rows[0];
+  return { holdExpiresAt: row?.hold_expires_at ?? null, holdExpired: row?.hold_expired === true };
 }

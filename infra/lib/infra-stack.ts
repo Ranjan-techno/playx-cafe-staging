@@ -7,6 +7,7 @@ import { networkConfigs } from './config/network-config';
 import { databaseConfigs } from './config/database-config';
 import { authConfigs } from './config/auth-config';
 import { apiConfigs } from './config/api-config';
+import { paymentConfigs, resolveSandboxTesters } from './config/payment-config';
 import { NetworkConstruct } from './constructs/network';
 import { DatabaseConstruct } from './constructs/database';
 import { MigrationConstruct } from './constructs/migration';
@@ -31,6 +32,7 @@ export class InfraStack extends cdk.Stack {
       vpcName: resourceName('vpc'),
       vpcCidr: networkConfig.vpcCidr,
       maxAzs: networkConfig.maxAzs,
+      natGateways: networkConfig.natGateways,
     });
 
     // Story 2.2: RDS PostgreSQL in the Story 2.1 VPC's isolated subnets, plus the
@@ -114,6 +116,10 @@ export class InfraStack extends cdk.Stack {
       adminPaymentsFunctionName: resourceName('admin-payments'),
       adminSimulatorsFunctionName: resourceName('admin-simulators'),
       adminBookingStatusFunctionName: resourceName('admin-booking-status'),
+      paymentStartFunctionName: resourceName('payment-start'),
+      paymentStatusFunctionName: resourceName('payment-status'),
+      paymentConfig: paymentConfigs[props.envConfig.environmentCode],
+      phonepeSandboxTesters: resolveSandboxTesters(this.node.tryGetContext('phonepeSandboxTesters')),
       vpc: network.vpc,
       lambdaSecurityGroup: database.lambdaSecurityGroup,
       databaseSecret,

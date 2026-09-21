@@ -13,15 +13,26 @@
 // creation transaction), this is a complete, self-contained unit of work with nothing else to
 // share a transaction with. Mirrors create-booking.ts's own top-level BEGIN/COMMIT/ROLLBACK style.
 //
-// Locking order — payments row, then bookings row — is fixed and never reversed anywhere else in
-// this codebase that touches both tables, so two concurrent confirmations (including for the same
-// booking via two different payment attempts) can never deadlock against each other.
+// LOCK ORDER — fixed for every transaction in this codebase that touches these tables:
+//   payment -> booking -> simulators (all active, ORDER BY code) -> booking_allocations
+// (create-booking takes simulators via allocateSimulators(); see booking-capacity.ts.) Never
+// reversed anywhere, so no two of these can deadlock.
+//
+// LATE PAYMENT: the provider's SUCCESS is truth about the money, but says nothing about whether
+// our simulator hold is still ours. Confirmation therefore goes through secureBookingCapacity():
+//   - hold still valid                      -> confirm normally
+//   - hold expired, capacity still free      -> re-allocate (same rig if free, else another of the
+//                                                right type) under the simulators lock, confirm
+//   - hold expired, capacity gone            -> payment is recorded PAID (the money did move),
+//                                                booking is NOT confirmed (cancelled, its stale
+//                                                holds released), payments.metadata carries
+//                                                refundRequired=true + a reason. Refund is manual
+//                                                in v1. A booking is never double-booked.
 
 import type { DbClient } from './allocate-simulators';
 import {
   AmountMismatchError,
   BookingAlreadyPaidError,
-  BookingNotConfirmableError,
   BookingNotFoundError,
   CurrencyMismatchError,
   DuplicateProviderTransactionError,
@@ -29,9 +40,11 @@ import {
   PaymentBookingMismatchError,
   PaymentNotFoundError,
 } from './payment-errors';
+import { secureBookingCapacity } from './booking-capacity';
+import { inrToPaise } from './money';
 import {
   TERMINAL_NON_PAID_STATUSES,
-  confirmBookingAllocations,
+  cancelPendingBooking,
   confirmBookingStatus,
   findOtherPaidPaymentForBooking,
   lockBookingForPayment,
@@ -40,9 +53,6 @@ import {
   type PaymentProvider,
 } from './payment-repository';
 
-// Booking statuses a successful payment is still allowed to land on. 'confirmed' is included so a
-// duplicate-callback replay (see below) that reaches this far is a harmless no-op, not an error.
-const CONFIRMABLE_BOOKING_STATUSES = new Set(['pending', 'confirmed']);
 
 export interface ConfirmSuccessfulPaymentInput {
   provider: PaymentProvider;
@@ -56,9 +66,9 @@ export interface ConfirmSuccessfulPaymentInput {
   expectedBookingId?: string;
   /** The amount the provider reports as actually paid, in rupees. Checked against
    *  payments.amount_inr (set at attempt-creation time from the booking's own price — see
-   *  create-payment-attempt.ts) — this parameter is provider-reported, therefore untrusted, and is
+   *  start-payment.ts) — this parameter is provider-reported, therefore untrusted, and is
    *  never written anywhere on its own say-so. */
-  amountInr: number;
+  amountInr: number | string;
   currency?: string;
   /** The provider's own transaction id for this successful attempt, if the provider supplies one.
    *  Recorded on the payment row; a collision with a different payment's transaction id is
@@ -66,17 +76,39 @@ export interface ConfirmSuccessfulPaymentInput {
   providerTransactionId?: string | null;
 }
 
+/** What the successful payment did to the booking.
+ *   confirmed                       - hold was valid; booking + allocations confirmed.
+ *   confirmed_after_reallocation    - hold had expired but capacity was free; re-allocated, confirmed.
+ *   refund_required                 - payment is PAID but the booking could NOT be confirmed (no
+ *                                     capacity, or booking already cancelled); metadata.refundRequired
+ *                                     is set for manual refund. */
+export type PaymentConfirmationOutcome = 'confirmed' | 'confirmed_after_reallocation' | 'refund_required';
+
 export interface ConfirmSuccessfulPaymentResult {
   paymentId: string;
   bookingId: string;
   /** True when this call found the payment already 'paid' (a duplicate provider callback) and
-   *  made no changes — the caller (a future webhook handler) can log this distinctly from a fresh
-   *  confirmation without it being an error. */
+   *  made no changes — `outcome` then reports what the original confirmation did. */
   alreadyConfirmed: boolean;
+  outcome: PaymentConfirmationOutcome;
 }
 
-function normalizeAmount(value: number | string): string {
-  return Number(value).toFixed(2);
+/** Exact comparison in integer paise — never floating point. A malformed reported amount is a
+ *  mismatch, not a crash. */
+function toPaiseOrNull(value: number | string): number | null {
+  try {
+    return inrToPaise(value);
+  } catch {
+    return null;
+  }
+}
+
+function outcomeOfPaidPayment(metadata: Record<string, unknown> | null): PaymentConfirmationOutcome {
+  if (metadata?.refundRequired === true) {
+    return 'refund_required';
+  }
+  const late = metadata?.lateConfirmation as { reallocated?: boolean } | undefined;
+  return late?.reallocated === true ? 'confirmed_after_reallocation' : 'confirmed';
 }
 
 /**
@@ -118,12 +150,17 @@ export async function confirmSuccessfulPayment(
       throw new PaymentBookingMismatchError(payment.id, input.expectedBookingId, payment.booking_id);
     }
 
-    // 5. Safely handle an already-paid attempt: a duplicate provider callback for a payment this
+    // Safely handle an already-paid attempt: a duplicate provider callback for a payment this
     // function already confirmed. Checked before amount/currency validation so a harmless replay
     // is never rejected over an incidental formatting difference in a repeated callback body.
     if (payment.payment_status === 'paid') {
       await db.query('COMMIT');
-      return { paymentId: payment.id, bookingId: payment.booking_id, alreadyConfirmed: true };
+      return {
+        paymentId: payment.id,
+        bookingId: payment.booking_id,
+        alreadyConfirmed: true,
+        outcome: outcomeOfPaidPayment(payment.metadata),
+      };
     }
 
     if (TERMINAL_NON_PAID_STATUSES.includes(payment.payment_status)) {
@@ -131,58 +168,99 @@ export async function confirmSuccessfulPayment(
     }
     // Only 'created' or 'pending' reach this point — both are valid predecessors of 'paid'.
 
-    // 4. Validate expected amount/currency using server-controlled values (payments.amount_inr/
+    // Validate expected amount/currency using server-controlled values (payments.amount_inr/
     // currency, set at attempt-creation time from the booking's own price — never from this call's
-    // input alone, and never from the browser at any point in the flow).
-    if (normalizeAmount(input.amountInr) !== normalizeAmount(payment.amount_inr)) {
-      throw new AmountMismatchError(normalizeAmount(payment.amount_inr), normalizeAmount(input.amountInr));
+    // input alone, and never from the browser at any point in the flow). Compared in integer paise.
+    const reportedPaise = toPaiseOrNull(input.amountInr);
+    const expectedPaise = toPaiseOrNull(payment.amount_inr);
+    if (reportedPaise === null || expectedPaise === null || reportedPaise !== expectedPaise) {
+      throw new AmountMismatchError(String(payment.amount_inr), reportedPaise === null ? 'invalid' : String(input.amountInr));
     }
     if (expectedCurrency !== payment.currency) {
       throw new CurrencyMismatchError(payment.currency, expectedCurrency);
     }
 
-    if (!CONFIRMABLE_BOOKING_STATUSES.has(booking.status)) {
-      throw new BookingNotConfirmableError(booking.id, booking.status);
-    }
-
     // Application-level mirror of idx_payments_one_paid_per_booking, checked up front for a clear
-    // error — the index itself (see markPaymentPaid below) is the DB-level backstop if this check
-    // and the UPDATE ever race (they can't within one locked booking row, but the constraint is
-    // kept regardless; see the migration's comment on it).
+    // error — the index itself (see markPaid below) is the DB-level backstop.
     const otherPaid = await findOtherPaidPaymentForBooking(db, booking.id, payment.id);
     if (otherPaid) {
       throw new BookingAlreadyPaidError(booking.id, otherPaid.id);
     }
 
-    // 6-8. Mark payment PAID, recording the provider transaction id (if supplied) and paid_at.
-    try {
-      await markPaymentPaid(db, payment.id, input.providerTransactionId ?? null);
-    } catch (err) {
-      if (isUniqueViolation(err, 'idx_payments_provider_transaction_id_unique')) {
-        throw new DuplicateProviderTransactionError(input.provider, input.providerTransactionId ?? '');
+    const markPaid = async (metadataPatch: Record<string, unknown> | null): Promise<void> => {
+      try {
+        await markPaymentPaid(db, payment.id, input.providerTransactionId ?? null, metadataPatch);
+      } catch (err) {
+        if (isUniqueViolation(err, 'idx_payments_provider_transaction_id_unique')) {
+          throw new DuplicateProviderTransactionError(input.provider, input.providerTransactionId ?? '');
+        }
+        if (isUniqueViolation(err, 'idx_payments_one_paid_per_booking')) {
+          throw new BookingAlreadyPaidError(booking.id, 'unknown');
+        }
+        throw err;
       }
-      if (isUniqueViolation(err, 'idx_payments_one_paid_per_booking')) {
-        // Belt-and-suspenders: the up-front findOtherPaidPaymentForBooking check above should
-        // already have caught this: this branch only fires against something like the fake test
-        // DB or a genuinely concurrent write this transaction's own booking-row lock should have
-        // serialized against.
-        throw new BookingAlreadyPaidError(booking.id, 'unknown');
-      }
-      throw err;
+    };
+    const detectedAt = new Date().toISOString();
+
+    // The money moved, so the payment is recorded PAID in every branch below — truthfully.
+
+    if (booking.status === 'cancelled' || booking.status === 'completed' || booking.status === 'no_show') {
+      // A paid attempt landed on a booking that is already terminal. Never resurrect it; record
+      // the payment and flag it for manual refund.
+      await markPaid({ refundRequired: true, reason: `booking_${booking.status}`, detectedAt });
+      await db.query('COMMIT');
+      return { paymentId: payment.id, bookingId: booking.id, alreadyConfirmed: false, outcome: 'refund_required' };
     }
 
-    // 9-10. Transition this booking's HOLD allocations to CONFIRMED and clear hold_expires_at.
-    await confirmBookingAllocations(db, booking.id);
+    if (booking.status === 'confirmed') {
+      // Already confirmed (e.g. an admin confirmed it, which itself secured capacity). Record the
+      // payment; do not touch allocations.
+      await markPaid(null);
+      await db.query('COMMIT');
+      return { paymentId: payment.id, bookingId: booking.id, alreadyConfirmed: false, outcome: 'confirmed' };
+    }
 
-    // 11. Update booking state compatibly with the existing bookings.status enum (see
-    // 003_payment_foundation.sql's header) — a no-op if it's already 'confirmed' (idempotent
-    // replay).
+    // booking.status === 'pending': secure capacity under the simulators lock (payment and booking
+    // are already locked, so the global order holds), then confirm or refuse.
+    const capacity = await secureBookingCapacity(db, booking);
+
+    if (capacity.kind === 'unavailable') {
+      await markPaid({
+        refundRequired: true,
+        reason: 'hold_expired_capacity_unavailable',
+        lateConfirmation: { reallocated: false, previousSimulatorIds: capacity.previousSimulatorIds, detectedAt },
+        bookingDisposition: 'cancelled',
+      });
+      // Obsolete holds were already released by secureBookingCapacity(); the booking is cancelled
+      // so it can't be paid again or mistaken for a live one. Deterministic state for manual
+      // refund: payment=paid, refundRequired=true, booking=cancelled, no live allocation.
+      await cancelPendingBooking(db, booking.id);
+      await db.query('COMMIT');
+      return { paymentId: payment.id, bookingId: booking.id, alreadyConfirmed: false, outcome: 'refund_required' };
+    }
+
+    if (capacity.kind === 'reallocated') {
+      await markPaid({
+        lateConfirmation: {
+          reallocated: true,
+          sameSimulators: capacity.sameSimulators,
+          previousSimulatorIds: capacity.previousSimulatorIds,
+          simulatorIds: capacity.simulatorIds,
+          detectedAt,
+        },
+      });
+    } else {
+      await markPaid(null);
+    }
     await confirmBookingStatus(db, booking.id);
-
-    // 12. Commit atomically.
     await db.query('COMMIT');
 
-    return { paymentId: payment.id, bookingId: booking.id, alreadyConfirmed: false };
+    return {
+      paymentId: payment.id,
+      bookingId: booking.id,
+      alreadyConfirmed: false,
+      outcome: capacity.kind === 'reallocated' ? 'confirmed_after_reallocation' : 'confirmed',
+    };
   } catch (err) {
     await db.query('ROLLBACK').catch(() => {});
     throw err;

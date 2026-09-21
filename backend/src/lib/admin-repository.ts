@@ -19,7 +19,8 @@ import {
   type BookingStatus,
 } from './booking-status';
 import { istPartsToUtcDate, toIstDateTimeParts } from './opening-hours';
-import { confirmBookingAllocations, type PaymentStatus } from './payment-repository';
+import { secureBookingCapacity } from './booking-capacity';
+import { lockBookingForPayment, type PaymentStatus } from './payment-repository';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -949,27 +950,26 @@ export async function getSimulatorBoard(db: DbClient, istDate: string): Promise<
 export type TransitionBookingStatusResult =
   | { outcome: 'not_found' }
   | { outcome: 'invalid_transition'; from: string; to: BookingStatus }
-  | { outcome: 'ok'; id: string; status: BookingStatus };
+  /** pending -> confirmed was refused: the booking's hold had expired and its simulator capacity
+   *  is no longer free. Nothing was changed. */
+  | { outcome: 'capacity_unavailable' }
+  | { outcome: 'ok'; id: string; status: BookingStatus; reallocated?: boolean };
 
 /**
  * Locks the booking row, validates the requested transition against booking-status.ts's whitelist,
  * and then does exactly one of:
  *   - for a target that confirmsAllocationOnTransition() (today: 'confirmed' — an admin manually
- *     confirming a pending walk-in/cash booking): confirms this booking's still-HOLD allocation
- *     row(s) — allocation_status = 'confirmed', hold_expires_at = NULL — via the same
- *     confirmBookingAllocations() a successful payment already uses, so the booking is never left
- *     'confirmed' while an allocation is still a temporary, expirable HOLD (this phase's audit
- *     brief, Issue 1).
+ *     confirming a pending walk-in/cash booking): secures the booking's simulator capacity via
+ *     secureBookingCapacity() — the same primitive a successful payment uses, under the same
+ *     simulators lock create-booking uses. A still-valid hold is confirmed; an EXPIRED hold is
+ *     re-allocated only if capacity is still free, otherwise the transition is refused with
+ *     'capacity_unavailable' and rolled back. This is what stops a manual confirmation from ever
+ *     booking a simulator that has since been given to someone else.
  *   - for a target that releasesAllocationOnTransition() (today: 'cancelled'): releases this
  *     booking's still-blocking (hold or confirmed) allocation rows, so a cancelled booking's
- *     simulator(s) stop blocking future availability immediately (see this phase's brief, item 8's
- *     "critical example").
+ *     simulator(s) stop blocking future availability immediately.
  * All of this happens in the one transaction started by `BEGIN` below — a thrown error at any
- * point rolls the whole thing back (booking status, allocation rows) via the catch block, so a
- * booking can never be left 'confirmed'/'cancelled' with its allocations in a stale state. Never
- * touches the payments table either way — payment state stays entirely separate, per item 9; this
- * endpoint represents an explicit manual/offline confirmation, never a substitute for
- * confirm-successful-payment.ts's PhonePe-driven one.
+ * point rolls the whole thing back. Never touches the payments table either way.
  */
 export async function transitionBookingStatus(
   db: DbClient,
@@ -979,11 +979,7 @@ export async function transitionBookingStatus(
   try {
     await db.query('BEGIN');
 
-    const { rows } = await db.query<{ id: string; status: string }>(
-      `SELECT id, status FROM bookings WHERE id = $1 FOR UPDATE`,
-      [bookingId],
-    );
-    const booking = rows[0];
+    const booking = await lockBookingForPayment(db, bookingId);
     if (!booking) {
       await db.query('ROLLBACK');
       return { outcome: 'not_found' };
@@ -995,14 +991,20 @@ export async function transitionBookingStatus(
       return { outcome: 'invalid_transition', from: currentStatus, to: targetStatus };
     }
 
+    let reallocated = false;
+    if (confirmsAllocationOnTransition(targetStatus)) {
+      // See this function's doc comment: never a blind HOLD -> confirmed flip.
+      const capacity = await secureBookingCapacity(db, booking);
+      if (capacity.kind === 'unavailable') {
+        await db.query('ROLLBACK');
+        return { outcome: 'capacity_unavailable' };
+      }
+      reallocated = capacity.kind === 'reallocated';
+    }
+
     await db.query(`UPDATE bookings SET status = $2 WHERE id = $1`, [bookingId, targetStatus]);
 
-    if (confirmsAllocationOnTransition(targetStatus)) {
-      // Reuses payment-repository.ts's writer rather than duplicating its SQL — see this
-      // function's doc comment. Idempotent/no-op on any allocation not currently 'hold' (e.g.
-      // already 'confirmed'), same as when a successful payment calls it.
-      await confirmBookingAllocations(db, bookingId);
-    } else if (releasesAllocationOnTransition(targetStatus)) {
+    if (releasesAllocationOnTransition(targetStatus)) {
       await db.query(
         `UPDATE booking_allocations
          SET allocation_status = 'released', hold_expires_at = NULL
@@ -1012,7 +1014,7 @@ export async function transitionBookingStatus(
     }
 
     await db.query('COMMIT');
-    return { outcome: 'ok', id: bookingId, status: targetStatus };
+    return { outcome: 'ok', id: bookingId, status: targetStatus, ...(reallocated ? { reallocated: true } : {}) };
   } catch (err) {
     await db.query('ROLLBACK').catch(() => {});
     throw err;
