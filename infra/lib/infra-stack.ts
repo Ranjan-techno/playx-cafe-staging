@@ -118,6 +118,7 @@ export class InfraStack extends cdk.Stack {
       adminBookingStatusFunctionName: resourceName('admin-booking-status'),
       paymentStartFunctionName: resourceName('payment-start'),
       paymentStatusFunctionName: resourceName('payment-status'),
+      paymentReconcileFunctionName: resourceName('payment-reconcile'),
       paymentConfig: paymentConfigs[props.envConfig.environmentCode],
       phonepeSandboxTesters: resolveSandboxTesters(this.node.tryGetContext('phonepeSandboxTesters')),
       vpc: network.vpc,

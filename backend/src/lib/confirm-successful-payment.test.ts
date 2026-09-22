@@ -3,7 +3,6 @@ import { test } from 'node:test';
 import { confirmSuccessfulPayment } from './confirm-successful-payment';
 import {
   AmountMismatchError,
-  BookingAlreadyPaidError,
   CurrencyMismatchError,
   DuplicateProviderTransactionError,
   PaymentAlreadyFinalizedError,
@@ -126,24 +125,36 @@ test('duplicate provider transaction is protected: a different payment attempt c
   assert.equal(store.bookings.find((b) => b.id === bookingB.id)!.status, 'pending', 'the second booking must not have been confirmed');
 });
 
-test('one successful payment per booking: a second payment attempt on an already-paid booking is rejected, not confirmed again', async () => {
+test('one successful payment per booking: a second collected payment is recorded PAID + flagged for manual refund, booking untouched', async () => {
   const store = createFakePaymentDbStore();
   const booking = seedBooking(store, { priceInr: '750.00', holdAllocations: 1 });
   const db = createFakePaymentDbClient(store);
 
   const paymentA = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'order-a', amountInr: '750.00' });
   await confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: paymentA.provider_order_id, amountInr: 750.0 });
+  const allocationsAfterFirst = JSON.stringify(store.allocations);
 
   // A second attempt against the same (already-confirmed) booking — e.g. the customer double-paid,
   // or a stale client retried checkout after the first attempt had already gone through.
   const paymentB = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'order-b', amountInr: '750.00' });
+  const result = await confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: paymentB.provider_order_id, amountInr: 750.0 });
 
-  await assert.rejects(
-    () => confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: paymentB.provider_order_id, amountInr: 750.0 }),
-    BookingAlreadyPaidError,
-  );
+  assert.equal(result.outcome, 'refund_required');
+  assert.equal(result.duplicateOfPaymentId, paymentA.id);
+  const storedB = store.payments.find((p) => p.id === paymentB.id)!;
+  assert.equal(storedB.payment_status, 'paid', 'the collected money is recorded, not discarded');
+  assert.equal(storedB.duplicate_of_payment_id, paymentA.id);
+  assert.equal(storedB.metadata?.refundRequired, true);
+  assert.equal(storedB.metadata?.manualReview, true);
+  assert.equal(storedB.metadata?.reason, 'duplicate_payment_booking_already_paid');
+  assert.equal(store.payments.find((p) => p.id === paymentA.id)!.metadata?.refundRequired, undefined, 'the primary payment is not flagged');
+  assert.equal(store.bookings.find((b) => b.id === booking.id)!.status, 'confirmed');
+  assert.equal(JSON.stringify(store.allocations), allocationsAfterFirst, 'no allocation is touched or added');
 
-  assert.equal(store.payments.filter((p) => p.payment_status === 'paid').length, 1, 'only the first attempt is ever paid');
+  // Replaying the duplicate is an idempotent no-op that still reports the duplicate.
+  const replay = await confirmSuccessfulPayment(db, { provider: 'mock', providerOrderId: paymentB.provider_order_id, amountInr: 750.0 });
+  assert.equal(replay.alreadyConfirmed, true);
+  assert.equal(replay.duplicateOfPaymentId, paymentA.id);
 });
 
 test('incorrect amount rejected: a provider-reported amount that does not match the payment record is rejected', async () => {
