@@ -19,6 +19,7 @@ import schema001 from '../../../../database/migrations/001_initial_schema.sql';
 import schema002 from '../../../../database/migrations/002_simulator_inventory.sql';
 import schema003 from '../../../../database/migrations/003_payment_foundation.sql';
 import schema004 from '../../../../database/migrations/004_short_booking_number.sql';
+import schema005 from '../../../../database/migrations/005_duplicate_payment_recording.sql';
 
 interface Migration {
   filename: string;
@@ -38,6 +39,9 @@ const MIGRATIONS: Migration[] = [
   // Short booking number: adds bookings.booking_number (4-digit, 1001-9999) — see the file's own
   // header for the sequence/backfill/constraint approach, additive only.
   { filename: '004_short_booking_number.sql', sql: schema004 },
+  // Duplicate-payment recording: narrows the one-paid-per-booking unique index to primary payments
+  // and adds payments.duplicate_of_payment_id — see the file's own header.
+  { filename: '005_duplicate_payment_recording.sql', sql: schema005 },
 ];
 
 interface DbSecret {
