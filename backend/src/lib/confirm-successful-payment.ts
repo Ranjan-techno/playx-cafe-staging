@@ -28,6 +28,12 @@
 //                                                holds released), payments.metadata carries
 //                                                refundRequired=true + a reason. Refund is manual
 //                                                in v1. A booking is never double-booked.
+//
+// SECOND SUCCESS: if the booking already has a primary paid payment and a different (historical)
+// order for it is later reported SUCCESS, the money really was collected twice. That fact is never
+// discarded: the second payment is recorded PAID (duplicate_of_payment_id -> the primary one),
+// flagged refundRequired + manualReview, and the booking/allocations are left exactly as the first
+// payment left them. No refund is ever claimed as done — it is a manual action for support.
 
 import type { DbClient } from './allocate-simulators';
 import {
@@ -51,6 +57,7 @@ import {
   lockPaymentByProviderOrderId,
   markPaymentPaid,
   type PaymentProvider,
+  type PaymentRow,
 } from './payment-repository';
 
 
@@ -91,6 +98,9 @@ export interface ConfirmSuccessfulPaymentResult {
    *  made no changes — `outcome` then reports what the original confirmation did. */
   alreadyConfirmed: boolean;
   outcome: PaymentConfirmationOutcome;
+  /** Set when this payment is a second collected payment for an already-paid booking: the id of
+   *  the payment that actually confirmed the booking. `outcome` is then 'refund_required'. */
+  duplicateOfPaymentId?: string;
 }
 
 /** Exact comparison in integer paise — never floating point. A malformed reported amount is a
@@ -101,6 +111,10 @@ function toPaiseOrNull(value: number | string): number | null {
   } catch {
     return null;
   }
+}
+
+function duplicateOfFromRow(payment: PaymentRow): string | undefined {
+  return payment.duplicate_of_payment_id ?? undefined;
 }
 
 function outcomeOfPaidPayment(metadata: Record<string, unknown> | null): PaymentConfirmationOutcome {
@@ -155,11 +169,13 @@ export async function confirmSuccessfulPayment(
     // is never rejected over an incidental formatting difference in a repeated callback body.
     if (payment.payment_status === 'paid') {
       await db.query('COMMIT');
+      const duplicateOf = duplicateOfFromRow(payment);
       return {
         paymentId: payment.id,
         bookingId: payment.booking_id,
         alreadyConfirmed: true,
         outcome: outcomeOfPaidPayment(payment.metadata),
+        ...(duplicateOf ? { duplicateOfPaymentId: duplicateOf } : {}),
       };
     }
 
@@ -180,16 +196,14 @@ export async function confirmSuccessfulPayment(
       throw new CurrencyMismatchError(payment.currency, expectedCurrency);
     }
 
-    // Application-level mirror of idx_payments_one_paid_per_booking, checked up front for a clear
-    // error — the index itself (see markPaid below) is the DB-level backstop.
+    // Application-level mirror of idx_payments_one_paid_per_booking (which only constrains PRIMARY
+    // paid payments — see 005_duplicate_payment_recording.sql). Another primary payment already
+    // confirmed this booking, so this one is a duplicate collection, handled below after markPaid.
     const otherPaid = await findOtherPaidPaymentForBooking(db, booking.id, payment.id);
-    if (otherPaid) {
-      throw new BookingAlreadyPaidError(booking.id, otherPaid.id);
-    }
 
-    const markPaid = async (metadataPatch: Record<string, unknown> | null): Promise<void> => {
+    const markPaid = async (metadataPatch: Record<string, unknown> | null, duplicateOfPaymentId: string | null = null): Promise<void> => {
       try {
-        await markPaymentPaid(db, payment.id, input.providerTransactionId ?? null, metadataPatch);
+        await markPaymentPaid(db, payment.id, input.providerTransactionId ?? null, metadataPatch, duplicateOfPaymentId);
       } catch (err) {
         if (isUniqueViolation(err, 'idx_payments_provider_transaction_id_unique')) {
           throw new DuplicateProviderTransactionError(input.provider, input.providerTransactionId ?? '');
@@ -203,6 +217,30 @@ export async function confirmSuccessfulPayment(
     const detectedAt = new Date().toISOString();
 
     // The money moved, so the payment is recorded PAID in every branch below — truthfully.
+
+    if (otherPaid) {
+      // Second collected payment for a booking a different payment already confirmed. Record the
+      // provider's truth; never touch the booking or its allocations (no double-confirm, no
+      // double-allocate) and never claim a refund happened — support must refund it manually.
+      await markPaid(
+        {
+          refundRequired: true,
+          manualReview: true,
+          reason: 'duplicate_payment_booking_already_paid',
+          duplicateOfPaymentId: otherPaid.id,
+          detectedAt,
+        },
+        otherPaid.id,
+      );
+      await db.query('COMMIT');
+      return {
+        paymentId: payment.id,
+        bookingId: booking.id,
+        alreadyConfirmed: false,
+        outcome: 'refund_required',
+        duplicateOfPaymentId: otherPaid.id,
+      };
+    }
 
     if (booking.status === 'cancelled' || booking.status === 'completed' || booking.status === 'no_show') {
       // A paid attempt landed on a booking that is already terminal. Never resurrect it; record

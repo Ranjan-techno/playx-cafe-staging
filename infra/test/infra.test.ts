@@ -20,7 +20,7 @@ test('Story 2.1 (+ payments egress): VPC keeps its isolated subnets and adds NAT
   // 2 AZs x (private-isolated [original] + public [NAT host only] + private-egress [payments]).
   template.resourceCountIs('AWS::EC2::Subnet', 6);
 
-  // Exactly ONE NAT Gateway (MVP cost control, payments egress only). Exactly nineteen Lambdas: Story 2.3's migration function, Story 2.5's
+  // Exactly ONE NAT Gateway (MVP cost control, payments egress only). Exactly twenty Lambdas: Story 2.3's migration function, Story 2.5's
   // health-check function, Story 2.6's products/create-booking/bookings-me functions, guest-
   // first passwordless auth's auth-start/auth-verify functions, its three Cognito CUSTOM_AUTH
   // triggers (DefineAuthChallenge/CreateAuthChallenge/VerifyAuthChallengeResponse), Phase 2's
@@ -30,7 +30,7 @@ test('Story 2.1 (+ payments egress): VPC keeps its isolated subnets and adds NAT
   // guarded against separately (that flag is explicitly disabled for this VPC — see
   // constructs/network.ts).
   template.resourceCountIs('AWS::EC2::NatGateway', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 19);
+  template.resourceCountIs('AWS::Lambda::Function', 20);
 });
 
 test('Story 2.2: RDS PostgreSQL created private, isolated, and encrypted, with a locked-down SG pair', () => {
@@ -97,7 +97,7 @@ test('Story 2.3: migration Lambda deployed in isolated subnets with no public tr
   // auth-start/auth-verify functions, its three CUSTOM_AUTH triggers, Phase 2's availability
   // function, and Phase 3B's six admin functions — see below), but health/auth-start/auth-verify/
   // the three triggers are the six of the seventeen that do NOT sit in the VPC.
-  template.resourceCountIs('AWS::Lambda::Function', 19);
+  template.resourceCountIs('AWS::Lambda::Function', 20);
   template.hasResourceProperties('AWS::Lambda::Function', {
     FunctionName: 'playx-dev-migrate',
     Runtime: 'nodejs22.x',
@@ -115,7 +115,11 @@ test('Story 2.3: migration Lambda deployed in isolated subnets with no public tr
   // it fronts the health function, never this one.)
   template.resourceCountIs('AWS::ApiGateway::RestApi', 0);
   template.resourceCountIs('AWS::Lambda::Url', 0);
-  template.resourceCountIs('AWS::Events::Rule', 0);
+  // The only EventBridge rule is Phase 5A's payment-reconcile schedule (asserted below) — it must
+  // never target the migration function.
+  for (const rule of Object.values<Record<string, any>>(template.toJSON().Resources).filter((r) => r.Type === 'AWS::Events::Rule')) {
+    assert.ok(!JSON.stringify(rule.Properties.Targets).includes('Migration'), 'no rule targets the migration Lambda');
+  }
 
   // IAM is scoped to this one secret's ARN, not a wildcard.
   template.hasResourceProperties('AWS::IAM::Policy', {
@@ -628,7 +632,7 @@ function synth(context?: Record<string, string>): { template: Template; json: Js
   return { template, json: template.toJSON() };
 }
 
-const PAYMENT_FUNCTIONS = ['playx-dev-payment-start', 'playx-dev-payment-status'];
+const PAYMENT_FUNCTIONS = ['playx-dev-payment-start', 'playx-dev-payment-status', 'playx-dev-payment-reconcile'];
 
 function lambdaEntries(json: Json): [string, Json][] {
   return Object.entries<Json>(json.Resources).filter(([, r]) => r.Type === 'AWS::Lambda::Function');
@@ -714,12 +718,12 @@ test('PhonePe Phase 2: payment Lambdas use private-with-egress subnets and the s
   }
   for (const name of PAYMENT_FUNCTIONS) {
     const fn = lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === name)?.[1];
-    assert.equal(fn?.Properties.Timeout, 25);
+    assert.equal(fn?.Properties.Timeout, name === 'playx-dev-payment-reconcile' ? 240 : 25);
     assert.equal(fn?.Properties.Runtime, 'nodejs22.x');
   }
 });
 
-test('PhonePe Phase 2: ONLY the two payment Lambdas can read the PhonePe secret, with GetSecretValue on that one secret', () => {
+test('PhonePe Phase 2: ONLY the payment Lambdas (start, status, reconcile) can read the PhonePe secret, with GetSecretValue on that one secret', () => {
   const { json } = synth();
   for (const [, fn] of lambdaEntries(json)) {
     const name = fn.Properties.FunctionName as string;
@@ -813,4 +817,49 @@ test('PhonePe Phase 2: POST /payments/start and GET /payments/{bookingId}/status
       ],
     }),
   });
+});
+
+test('Phase 5A: payment reconciliation runs on an EventBridge schedule every 5 minutes, targeting only the reconcile Lambda, with no retries', () => {
+  const { template, json } = synth();
+  template.resourceCountIs('AWS::Events::Rule', 1);
+  const [ruleId, rule] = Object.entries<Json>(json.Resources).find(([, r]) => r.Type === 'AWS::Events::Rule')!;
+  assert.equal(rule.Properties.ScheduleExpression, 'rate(5 minutes)');
+  assert.equal(rule.Properties.State, 'ENABLED');
+  assert.equal(rule.Properties.Targets.length, 1);
+  const target = rule.Properties.Targets[0];
+  assert.equal(target.RetryPolicy.MaximumRetryAttempts, 0);
+
+  const reconcile = lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === 'playx-dev-payment-reconcile')!;
+  assert.deepEqual(target.Arn, { 'Fn::GetAtt': [reconcile[0], 'Arn'] });
+
+  // The rule (and only the rule) may invoke it.
+  const permissions = Object.values<Json>(json.Resources).filter(
+    (r) => r.Type === 'AWS::Lambda::Permission' && r.Properties.Principal === 'events.amazonaws.com',
+  );
+  assert.equal(permissions.length, 1);
+  assert.deepEqual(permissions[0].Properties.SourceArn, { 'Fn::GetAtt': [ruleId, 'Arn'] });
+});
+
+test('Phase 5A: the reconcile Lambda has only DB-secret read + GetSecretValue on the one PhonePe secret, no API route, and no extra NAT', () => {
+  const { template, json } = synth();
+  const statements = statementsFor(json, 'playx-dev-payment-reconcile');
+  const secretsActions = statements
+    .filter((st) => JSON.stringify(st.Action).includes('secretsmanager'))
+    .map((st) => [st.Action].flat().sort().join(','));
+  assert.deepEqual(secretsActions.sort(), [
+    'secretsmanager:DescribeSecret,secretsmanager:GetSecretValue',
+    'secretsmanager:GetSecretValue',
+  ]);
+  const nonSecrets = statements.filter((st) => !JSON.stringify(st.Action).includes('secretsmanager'));
+  for (const st of nonSecrets) {
+    // Only the CDK-default VPC/log ENI plumbing (managed-policy/log statements) — nothing app-specific.
+    assert.ok(!JSON.stringify(st.Action).match(/s3|dynamodb|sqs|sns|ses|cognito|lambda:Invoke/i), JSON.stringify(st.Action));
+  }
+  const fn = lambdaEntries(json).find(([, r]) => r.Properties.FunctionName === 'playx-dev-payment-reconcile')![1];
+  assert.equal(fn.Properties.Environment.Variables.RECONCILE_BATCH_SIZE, '25');
+  assert.ok(!('RECONCILE_MAX_AGE_MINUTES' in fn.Properties.Environment.Variables), 'no age cut-off for open attempts');
+  assert.ok(!('PHONEPE_SANDBOX_TESTERS' in fn.Properties.Environment.Variables));
+  template.resourceCountIs('AWS::EC2::NatGateway', 1);
+  const routeKeys = Object.values<Json>(json.Resources).filter((r) => r.Type === 'AWS::ApiGatewayV2::Route').map((r) => r.Properties.RouteKey);
+  assert.ok(!routeKeys.some((k) => /reconcile/i.test(k)));
 });

@@ -29,6 +29,9 @@ export interface PaymentRow {
   payment_status: PaymentStatus;
   failure_reason: string | null;
   metadata: Record<string, unknown> | null;
+  /** Set only on a 'paid' row that duplicates an earlier paid payment for the same booking (see
+   *  005_duplicate_payment_recording.sql). NULL/undefined for every primary payment. */
+  duplicate_of_payment_id?: string | null;
   created_at: Date;
   updated_at: Date;
   paid_at: Date | null;
@@ -108,8 +111,11 @@ export async function lockPaymentByProviderOrderId(
   return rows[0] ?? null;
 }
 
-/** Any *other* 'paid' payment already recorded for this booking — the application-level mirror of
- *  the idx_payments_one_paid_per_booking partial unique index, checked before attempting the
+/** Any *other* primary 'paid' or 'refunded' payment already recorded for this booking (rows flagged as duplicates
+ *  via the duplicate_of_payment_id column — see markPaymentPaid and migration 005 — don't count; the column,
+ *  not the metadata audit mirror, is the source of truth) — the application-level mirror of
+ *  the idx_payments_one_paid_per_booking (a refunded primary stays the primary — refunding it must
+ *  not let a later collection become a second primary) partial unique index, checked before attempting the
  *  UPDATE below so a real double-payment produces a clear BookingAlreadyPaidError instead of a raw
  *  constraint-violation. `excludePaymentId` is the attempt currently being confirmed, so it never
  *  matches itself. */
@@ -119,13 +125,16 @@ export async function findOtherPaidPaymentForBooking(
   excludePaymentId: string,
 ): Promise<{ id: string } | null> {
   const { rows } = await db.query<{ id: string }>(
-    `SELECT id FROM payments WHERE booking_id = $1 AND payment_status = 'paid' AND id <> $2`,
+    `SELECT id FROM payments
+     WHERE booking_id = $1 AND payment_status IN ('paid', 'refunded') AND id <> $2
+       AND duplicate_of_payment_id IS NULL`,
     [bookingId, excludePaymentId],
   );
   return rows[0] ?? null;
 }
 
-/** The one writer of payment_status = 'paid'. Only called after every validation in
+/** The one writer of payment_status = 'paid'. `duplicateOfPaymentId` is set only when this payment
+ *  is a second collected payment for a booking another payment already confirmed. Only called after every validation in
  *  confirm-successful-payment.ts has already passed — this function itself has no policy, it just
  *  performs the write (and lets a unique-constraint violation on provider_transaction_id surface
  *  to the caller, which translates it into DuplicateProviderTransactionError). */
@@ -134,15 +143,21 @@ export async function markPaymentPaid(
   paymentId: string,
   providerTransactionId: string | null,
   metadataPatch: Record<string, unknown> | null = null,
+  duplicateOfPaymentId: string | null = null,
 ): Promise<void> {
+  // duplicate_of_payment_id is only mentioned when set, so ordinary confirmations keep working
+  // against a database that hasn't had migration 005 applied yet.
+  const duplicateClause = duplicateOfPaymentId ? ', duplicate_of_payment_id = $4' : '';
   await db.query(
     `UPDATE payments
      SET payment_status = 'paid',
          provider_transaction_id = COALESCE($2, provider_transaction_id),
          metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE($3::jsonb, '{}'::jsonb),
-         paid_at = now()
+         paid_at = now()${duplicateClause}
      WHERE id = $1`,
-    [paymentId, providerTransactionId, metadataPatch],
+    duplicateOfPaymentId
+      ? [paymentId, providerTransactionId, metadataPatch, duplicateOfPaymentId]
+      : [paymentId, providerTransactionId, metadataPatch],
   );
 }
 
@@ -312,4 +327,37 @@ export async function getBookingHoldState(
   );
   const row = rows[0];
   return { holdExpiresAt: row?.hold_expires_at ?? null, holdExpired: row?.hold_expired === true };
+}
+
+export interface ReconcilableAttempt {
+  id: string;
+  booking_id: string;
+  provider: PaymentProvider;
+  provider_order_id: string;
+  payment_status: PaymentStatus;
+}
+
+/** Background-reconciliation candidates: open ('created'/'pending') PhonePe attempts that have a
+ *  live provider order (metadata.checkout.redirectUrl is written only after the order exists —
+ *  same test payment-status.ts uses). There is deliberately NO age cut-off: a customer who paid
+ *  and never came back must still be reconciled however old the attempt is; stale-attempt cleanup
+ *  is a separate policy. Terminal rows
+ *  (paid/failed/expired/refunded) are never selected. Least-recently-checked first (falling back
+ *  to created_at), so a bounded batch rotates through all open attempts instead of re-checking the
+ *  same oldest rows. Read-only, no lock: confirmSuccessfulPayment locks per payment. */
+export async function listPaymentsForReconciliation(
+  db: DbClient,
+  limit: number,
+): Promise<ReconcilableAttempt[]> {
+  const { rows } = await db.query<ReconcilableAttempt>(
+    `SELECT id, booking_id, provider, provider_order_id, payment_status
+     FROM payments
+     WHERE provider = 'phonepe'
+       AND payment_status IN ('created', 'pending')
+       AND metadata #>> '{checkout,redirectUrl}' IS NOT NULL
+     ORDER BY COALESCE((metadata ->> 'reconcileCheckedAt')::timestamptz, created_at), id
+     LIMIT $1`,
+    [limit],
+  );
+  return rows;
 }

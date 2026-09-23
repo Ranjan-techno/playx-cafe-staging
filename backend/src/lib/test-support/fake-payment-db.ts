@@ -52,6 +52,7 @@ export interface FakePaymentRow {
   payment_status: PaymentStatus;
   failure_reason: string | null;
   metadata: Record<string, unknown> | null;
+  duplicate_of_payment_id?: string | null;
   created_at: Date;
   updated_at: Date;
   paid_at: Date | null;
@@ -331,10 +332,37 @@ export function createFakePaymentDbClient(store: FakePaymentDbStore): FakePaymen
 
     // findOtherPaidPaymentForBooking: SELECT id FROM payments WHERE booking_id = $1 AND
     // payment_status = 'paid' AND id <> $2
-    if (/FROM payments\b/i.test(sql) && /payment_status = 'paid'/i.test(sql) && /id <> \$2/i.test(sql)) {
+    if (/FROM payments\b/i.test(sql) && /payment_status IN \('paid', 'refunded'\)/i.test(sql) && /id <> \$2/i.test(sql)) {
       const [bookingId, excludeId] = params as [string, string];
-      const row = store.payments.find((p) => p.booking_id === bookingId && p.payment_status === 'paid' && p.id !== excludeId);
+      const row = store.payments.find(
+        (p) =>
+          p.booking_id === bookingId &&
+          (p.payment_status === 'paid' || p.payment_status === 'refunded') &&
+          p.id !== excludeId &&
+          !p.duplicate_of_payment_id,
+      );
       return { rows: (row ? [{ id: row.id }] : []) as unknown as T[] };
+    }
+
+    // listPaymentsForReconciliation: open phonepe attempts with a live checkout, recent, least
+    // recently checked first. $1 = limit. No age cut-off.
+    if (/FROM payments\b/i.test(sql) && /payment_status IN \('created', 'pending'\)/i.test(sql) && /LIMIT \$1/i.test(sql)) {
+      const [limit] = params as [number];
+      const checkedAt = (p: FakePaymentRow): number => {
+        const c = p.metadata?.reconcileCheckedAt;
+        return typeof c === 'string' ? Date.parse(c) : p.created_at.getTime();
+      };
+      const rows = store.payments
+        .filter(
+          (p) =>
+            p.provider === 'phonepe' &&
+            (p.payment_status === 'created' || p.payment_status === 'pending') &&
+            typeof (p.metadata?.checkout as { redirectUrl?: unknown } | undefined)?.redirectUrl === 'string',
+        )
+        .sort((a, b) => checkedAt(a) - checkedAt(b) || a.id.localeCompare(b.id))
+        .slice(0, limit)
+        .map(({ id, booking_id, provider, provider_order_id, payment_status }) => ({ id, booking_id, provider, provider_order_id, payment_status }));
+      return { rows: rows as unknown as T[] };
     }
 
     // lockSimulatorInventory: SELECT ... FROM simulators ... ORDER BY code FOR UPDATE (whole table,
@@ -479,10 +507,11 @@ export function createFakePaymentDbClient(store: FakePaymentDbStore): FakePaymen
     // markPaymentPaid: UPDATE payments SET payment_status = 'paid', provider_transaction_id =
     // COALESCE($2, provider_transaction_id), paid_at = now() WHERE id = $1
     if (/^UPDATE payments\b/i.test(sql) && /payment_status = 'paid'/i.test(sql)) {
-      const [paymentId, providerTransactionId, metadataPatch] = params as [
+      const [paymentId, providerTransactionId, metadataPatch, duplicateOfPaymentId] = params as [
         string,
         string | null,
         Record<string, unknown> | null,
+        string | undefined,
       ];
       const row = store.payments.find((p) => p.id === paymentId);
       if (!row) {
@@ -497,9 +526,15 @@ export function createFakePaymentDbClient(store: FakePaymentDbStore): FakePaymen
           throw pgUniqueViolation('idx_payments_provider_transaction_id_unique');
         }
       }
-      const collidesOnPaidBooking = store.payments.some(
-        (p) => p.id !== paymentId && p.booking_id === row.booking_id && p.payment_status === 'paid',
-      );
+      // Mirrors the narrowed idx_payments_one_paid_per_booking: only PRIMARY paid rows collide.
+      const collidesOnPaidBooking =
+        !duplicateOfPaymentId &&
+        store.payments.some(
+          (p) => p.id !== paymentId &&
+          p.booking_id === row.booking_id &&
+          (p.payment_status === 'paid' || p.payment_status === 'refunded') &&
+          !p.duplicate_of_payment_id,
+        );
       if (collidesOnPaidBooking) {
         throw pgUniqueViolation('idx_payments_one_paid_per_booking');
       }
@@ -507,6 +542,9 @@ export function createFakePaymentDbClient(store: FakePaymentDbStore): FakePaymen
       row.payment_status = 'paid';
       row.metadata = { ...(row.metadata ?? {}), ...(metadataPatch ?? {}) };
       row.provider_transaction_id = newTransactionId;
+      if (duplicateOfPaymentId) {
+        row.duplicate_of_payment_id = duplicateOfPaymentId;
+      }
       row.paid_at = new Date();
       row.updated_at = new Date();
       return { rows: [] };

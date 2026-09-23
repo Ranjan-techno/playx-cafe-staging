@@ -72,7 +72,7 @@ const MAX_RECOVERY_ROUNDS = 2;
 
 export interface StartPaymentInput {
   bookingId: string;
-  /** 'SANDBOX' | 'PRODUCTION' — recorded in payments.metadata.environment. */
+  /** 'SANDBOX' | 'PRODUCTION' — recorded in payments.metadata.paymentEnvironment (and .environment). */
   environment: string;
   /** Configurable hold/order lifetime once checkout starts (payment-settings.ts). */
   checkoutHoldMinutes: number;
@@ -289,6 +289,9 @@ async function reservePaymentAttempt(
       currency: 'INR',
       metadata: {
         environment: input.environment,
+        // Stable marker read by admin revenue/refund-exposure totals (SANDBOX is never real money).
+        // From the validated PhonePe config via the handler — never from the request.
+        paymentEnvironment: input.environment,
         holdExtended: extendedNow || undefined,
         holdReestablished: holdReestablished || undefined,
         holdExpiresAt: holdExpiresAt.toISOString(),

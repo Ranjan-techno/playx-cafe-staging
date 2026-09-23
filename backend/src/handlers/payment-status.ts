@@ -49,9 +49,13 @@ function hasLiveCheckout(payment: PaymentRow): boolean {
   return typeof checkout?.redirectUrl === 'string';
 }
 
-/** The attempt the customer cares about: a paid one if any, else the most recent. */
+/** The attempt the customer cares about: the paid one that confirmed the booking if any (never a
+ *  duplicate second payment, which is only a refund matter), else the most recent. */
 function currentPayment(payments: PaymentRow[]): PaymentRow | undefined {
-  return payments.find((p) => p.payment_status === 'paid') ?? payments[payments.length - 1];
+  return (
+    payments.find((p) => p.payment_status === 'paid' && !p.duplicate_of_payment_id) ??
+    payments[payments.length - 1]
+  );
 }
 
 export function createHandler(deps: PaymentStatusDeps = defaultDeps) {

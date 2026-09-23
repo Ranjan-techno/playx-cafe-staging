@@ -155,3 +155,23 @@ test('markPaymentPending only ever moves a "created" attempt to "pending"', asyn
   await markPaymentPending(db, payment.id);
   assert.equal(store.payments.find((p) => p.id === payment.id)!.payment_status, 'paid', 'a paid payment must never revert to pending');
 });
+
+test('findOtherPaidPaymentForBooking: the duplicate_of_payment_id column, not the metadata mirror, decides who is primary', async () => {
+  const store = createFakePaymentDbStore();
+  const booking = seedBooking(store, { priceInr: '399.00' });
+  const db = createFakePaymentDbClient(store);
+  const primary = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'p', amountInr: '399.00' });
+  const dup = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'd', amountInr: '399.00' });
+  const probe = await createPaymentAttempt(db, { bookingId: booking.id, provider: 'mock', providerOrderId: 'x', amountInr: '399.00' });
+  await markPaymentPaid(db, primary.id, null);
+  await markPaymentPaid(db, dup.id, null, null, primary.id);
+
+  assert.equal((await findOtherPaidPaymentForBooking(db, booking.id, probe.id))?.id, primary.id, 'duplicate row is never the primary');
+
+  // Metadata alone (no column) does not make a row a duplicate.
+  const row = store.payments.find((p) => p.id === dup.id)!;
+  row.duplicate_of_payment_id = null;
+  row.metadata = { ...(row.metadata ?? {}), duplicateOfPaymentId: primary.id };
+  const found = await findOtherPaidPaymentForBooking(db, booking.id, probe.id);
+  assert.ok(found, 'a paid row with a NULL column is a primary candidate regardless of metadata');
+});

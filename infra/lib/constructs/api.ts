@@ -5,6 +5,8 @@ import * as apigwv2Authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as apigwv2Integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -43,6 +45,8 @@ export interface ApiConstructProps {
   /** PhonePe payments (Phase 2): full resource names for the two customer payment Lambdas. */
   paymentStartFunctionName: string;
   paymentStatusFunctionName: string;
+  /** Phase 5A: scheduled background reconciliation Lambda, e.g. 'playx-dev-payment-reconcile'. */
+  paymentReconcileFunctionName: string;
   paymentConfig: PaymentConfig;
   /** Comma-separated Cognito subs/verified emails allowed to start SANDBOX payments. Empty fails
    *  closed (nobody may start one) — see config/payment-config.ts. */
@@ -112,6 +116,8 @@ export class ApiConstruct extends Construct {
   public readonly adminBookingStatusFunction: lambdaNodejs.NodejsFunction;
   public readonly paymentStartFunction: lambdaNodejs.NodejsFunction;
   public readonly paymentStatusFunction: lambdaNodejs.NodejsFunction;
+  public readonly paymentReconcileFunction: lambdaNodejs.NodejsFunction;
+  public readonly paymentReconcileRule: events.Rule;
 
   constructor(scope: Construct, id: string, props: ApiConstructProps) {
     super(scope, id);
@@ -285,6 +291,38 @@ export class ApiConstruct extends Construct {
     });
     props.databaseSecret.grantRead(this.paymentStatusFunction);
     grantPhonePeSecret(this.paymentStatusFunction);
+
+    // Phase 5A: background reconciliation, so a customer never depends on returning to
+    // payment-return.html. Same placement as the other payment Lambdas (private-with-egress subnets
+    // behind the existing single NAT, shared Lambda SG): RDS over the VPC-local route, PhonePe over
+    // NAT. IAM is exactly what the handler needs — read the DB secret and GetSecretValue on the one
+    // PhonePe secret. No API route, no other permissions, no new NAT/VPC resources.
+    this.paymentReconcileFunction = new lambdaNodejs.NodejsFunction(this, 'PaymentReconcileFunction', {
+      ...paymentFunctionDefaults,
+      functionName: props.paymentReconcileFunctionName,
+      entry: path.join(__dirname, '../../../backend/src/handlers/payment-reconcile.ts'),
+      // Not bound by API Gateway's 30s cut-off: a bounded batch (25) of sequential provider calls.
+      // The handler stops starting new items when <30s remain.
+      timeout: cdk.Duration.minutes(4),
+      environment: {
+        ...phonepeCommonEnv,
+        RECONCILE_BATCH_SIZE: '25',
+      },
+    });
+    props.databaseSecret.grantRead(this.paymentReconcileFunction);
+    grantPhonePeSecret(this.paymentReconcileFunction);
+
+    this.paymentReconcileRule = new events.Rule(this, 'PaymentReconcileSchedule', {
+      description: 'Every 5 minutes: reconcile open PhonePe payment attempts (background sweep)',
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [
+        new eventsTargets.LambdaFunction(this.paymentReconcileFunction, {
+          // The next scheduled run is the retry; async retries would only overlap it.
+          retryAttempts: 0,
+          maxEventAge: cdk.Duration.minutes(5),
+        }),
+      ],
+    });
 
     // Not VPC-attached, same as healthFunction: these only call Cognito's regional Admin* APIs,
     // never the database.

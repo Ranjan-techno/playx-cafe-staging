@@ -136,6 +136,7 @@ test('start: returns only the safe shape; amount comes from the DB, not the requ
   assert.equal(w.provider.createCalls[0].amountInr, '999.00', 'amount is bookings.price_inr');
   assert.equal(w.store.payments[0].amount_inr, '999.00');
   assert.equal(w.store.payments[0].metadata?.environment, 'SANDBOX', 'environment is config, not request');
+  assert.equal(w.store.payments[0].metadata?.paymentEnvironment, 'SANDBOX', 'marker comes from the PhonePe config, not the request body claiming PRODUCTION');
   const returnUrl = new URL(String(w.provider.createCalls[0].returnUrl));
   assert.equal(returnUrl.origin + returnUrl.pathname, 'https://staging.playxcafe.com/payment-return.html');
   assert.equal(returnUrl.searchParams.get('bookingId'), w.bookingId);
@@ -193,6 +194,14 @@ test('SANDBOX: a normal, unlisted production customer cannot start a sandbox pay
   assert.equal(res.statusCode, 403);
   assert.equal(w.provider.createCalls.length, 0);
   assert.equal(w.store.payments.length, 0);
+});
+
+test('start: a PRODUCTION PhonePe config stores paymentEnvironment=PRODUCTION automatically (request cannot influence it)', async () => {
+  const w = setup({ PHONEPE_ENVIRONMENT: 'PRODUCTION' });
+  w.provider.environment = 'PRODUCTION';
+  const res = await call(() => w.start(startEvent({ bookingId: w.bookingId, paymentEnvironment: 'SANDBOX', environment: 'SANDBOX' })));
+  assert.equal(res.statusCode, 200);
+  assert.equal(w.store.payments[0].metadata?.paymentEnvironment, 'PRODUCTION');
 });
 
 test('SANDBOX gate is re-checked against the environment the secret actually declares', async () => {
@@ -413,4 +422,18 @@ test('status: an already-paid booking is not re-reconciled with the provider', a
   const res = await call(() => w.status(statusEvent(w.bookingId)));
   assert.equal(res.body.outcome, 'confirmed');
   assert.equal(w.provider.statusCalls.length, 0);
+});
+
+test('status: a duplicate paid row (column) never becomes the current payment; primary stays primary', async () => {
+  const w = setup();
+  const payment = await started(w);
+  w.provider.statuses.set(payment.provider_order_id, { outcome: 'SUCCESS', amountInr: '999.00', currency: 'INR', providerTransactionId: 'T-P' });
+  await call(() => w.status(statusEvent(w.bookingId)));
+  const primary = w.store.payments[0];
+  // A later duplicate, newer than the primary, flagged only via the column.
+  w.store.payments.push({ ...primary, id: randomUUID(), provider_order_id: 'dup-order', payment_status: 'paid', duplicate_of_payment_id: primary.id, metadata: {}, created_at: new Date(primary.created_at.getTime() + 1000) });
+  const res = await call(() => w.status(statusEvent(w.bookingId)));
+  assert.equal(res.body.paymentStatus, 'paid');
+  assert.equal(res.body.outcome, 'confirmed', 'duplicate row is not reported as the current payment');
+  assert.equal(w.store.allocations.filter((a) => a.allocation_status === 'confirmed').length, w.store.allocations.length, 'no double allocation');
 });

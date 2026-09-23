@@ -9,6 +9,7 @@
 // ILIKE wildcard characters (`%`, `_`, `\`) escaped so a search string can only ever match itself
 // literally, never expand into a broader wildcard the caller didn't intend.
 
+import { inrToPaise, paiseToInr } from './money';
 import type { DbClient } from './allocate-simulators';
 import {
   BOOKING_STATUSES,
@@ -150,6 +151,9 @@ export interface DashboardSummary {
   holds: { active: number; expired: number };
   payments: { paid: number; pending: number; failed: number };
   revenue: { paidInr: number };
+  /** Money collected that support must refund manually (duplicate / paid-but-unfulfillable).
+   *  Operational only — never counted in `revenue`. */
+  refundRequired: { count: number; amountInr: number };
   simulators: { total: number; static: number; motion: number };
 }
 
@@ -200,6 +204,71 @@ interface HoldAllocationRow {
  *     unsuccessful outcomes. 'refunded' is deliberately excluded from every bucket (it was 'paid'
  *     first, so double-counting it as revenue-or-not is a future phase's call, not this one's).
  */
+/** Support-facing wording for payments.metadata.reason. A fixed whitelist: an unrecognised or
+ *  missing code yields the generic label, so no arbitrary metadata text ever reaches the admin
+ *  response. */
+export function describePaymentReviewReason(code: string | null | undefined): string {
+  switch (code) {
+    case 'duplicate_payment_booking_already_paid':
+      return 'Duplicate payment (booking already paid)';
+    case 'hold_expired_capacity_unavailable':
+      return 'Paid after reservation expired / capacity unavailable';
+    case 'booking_cancelled':
+      return 'Paid after booking was cancelled';
+    case 'booking_completed':
+      return 'Paid after booking was completed';
+    case 'booking_no_show':
+      return 'Paid after booking was marked no-show';
+    default:
+      return 'Refund required';
+  }
+}
+
+export type PaymentEnvironmentLabel = 'SANDBOX' | 'PRODUCTION';
+
+/** Whitelist: only the two known values ever reach the admin response. */
+export function toPaymentEnvironment(value: string | null | undefined): PaymentEnvironmentLabel | null {
+  return value === 'SANDBOX' || value === 'PRODUCTION' ? value : null;
+}
+
+export interface CollectedPaymentRow {
+  payment_status: string;
+  amount_inr: string;
+  /** payments.metadata.refundRequired = true (typed extract, never the raw blob). */
+  refund_required: boolean | null;
+  /** payments.metadata.paymentEnvironment; absent/null on older rows. */
+  payment_environment?: string | null;
+}
+
+/** Revenue = genuine (non-SANDBOX) PAID payments that Play X Cafe actually keeps. SANDBOX rows are
+ *  test transactions: excluded from BOTH revenue and refund exposure. A paid payment flagged refundRequired
+ *  (duplicate collection, or paid after the reservation was lost) is customer money awaiting a
+ *  manual refund, so it is reported separately and never as revenue. Refunded rows are neither.
+ *  Summed in integer paise, never floating point. */
+export function summarizeCollectedPayments(rows: CollectedPaymentRow[]): {
+  revenue: { paidInr: number };
+  refundRequired: { count: number; amountInr: number };
+} {
+  let revenuePaise = 0;
+  let refundPaise = 0;
+  let refundCount = 0;
+  for (const row of rows) {
+    if (row.payment_status !== 'paid') continue;
+    if (row.payment_environment === 'SANDBOX') continue;
+    const paise = inrToPaise(row.amount_inr);
+    if (row.refund_required === true) {
+      refundPaise += paise;
+      refundCount += 1;
+    } else {
+      revenuePaise += paise;
+    }
+  }
+  return {
+    revenue: { paidInr: Number(paiseToInr(revenuePaise)) },
+    refundRequired: { count: refundCount, amountInr: Number(paiseToInr(refundPaise)) },
+  };
+}
+
 export function buildDashboardSummary(
   date: string,
   bookingCounts: BookingStatusCountRow[],
@@ -208,6 +277,7 @@ export function buildDashboardSummary(
   simulatorCounts: SimulatorTypeCountRow[],
   holdRows: HoldAllocationRow[],
   now: Date,
+  refundRequired: { count: number; amountInr: number } = { count: 0, amountInr: 0 },
 ): DashboardSummary {
   const bookingsByStatus = new Map(bookingCounts.map((row) => [row.status, Number(row.count)]));
   const paymentsByStatus = new Map(paymentCounts.map((row) => [row.payment_status, Number(row.count)]));
@@ -239,6 +309,7 @@ export function buildDashboardSummary(
       failed: (paymentsByStatus.get('failed') ?? 0) + (paymentsByStatus.get('expired') ?? 0),
     },
     revenue: { paidInr: paidRevenueInr },
+    refundRequired,
     simulators: { total: staticCount + motionCount, static: staticCount, motion: motionCount },
   };
 }
@@ -268,16 +339,23 @@ export async function getDashboardSummary(db: DbClient, istDate: string): Promis
     `SELECT payment_status, COUNT(*) AS count
      FROM payments
      WHERE created_at >= $1 AND created_at < $2
+       AND COALESCE(metadata ->> 'paymentEnvironment', '') <> 'SANDBOX'
      GROUP BY payment_status`,
     [start, end],
   );
 
-  const { rows: revenueRows } = await db.query<{ sum: string | null }>(
-    `SELECT COALESCE(SUM(amount_inr), 0) AS sum
+  // Raw rows (typed extracts only), summarized by summarizeCollectedPayments() so the
+  // revenue-vs-refund-required rule is unit-testable. Refunded rows are excluded by status.
+  const { rows: collectedRows } = await db.query<CollectedPaymentRow>(
+    `SELECT payment_status, amount_inr,
+            (metadata ->> 'refundRequired') = 'true' AS refund_required,
+            metadata ->> 'paymentEnvironment' AS payment_environment
      FROM payments
-     WHERE payment_status = 'paid' AND paid_at >= $1 AND paid_at < $2`,
+     WHERE payment_status = 'paid' AND paid_at >= $1 AND paid_at < $2
+       AND COALESCE(metadata ->> 'paymentEnvironment', '') <> 'SANDBOX'`,
     [start, end],
   );
+  const collected = summarizeCollectedPayments(collectedRows);
 
   const { rows: simulatorCounts } = await db.query<SimulatorTypeCountRow>(
     `SELECT simulator_type, COUNT(*) AS count FROM simulators WHERE is_active = true GROUP BY simulator_type`,
@@ -292,7 +370,7 @@ export async function getDashboardSummary(db: DbClient, istDate: string): Promis
     [start, end],
   );
 
-  return buildDashboardSummary(istDate, bookingCounts, paymentCounts, Number(revenueRows[0]?.sum ?? 0), simulatorCounts, holdRows, new Date());
+  return buildDashboardSummary(istDate, bookingCounts, paymentCounts, collected.revenue.paidInr, simulatorCounts, holdRows, new Date(), collected.refundRequired);
 }
 
 // ============================================================================
@@ -535,6 +613,10 @@ interface AdminPaymentAttemptRow {
   failure_reason: string | null;
   created_at: Date;
   paid_at: Date | null;
+  refund_required?: boolean | null;
+  payment_environment?: string | null;
+  review_reason?: string | null;
+  duplicate_of_payment_id?: string | null;
 }
 
 export interface AdminBookingDetail {
@@ -571,6 +653,10 @@ export interface AdminBookingDetail {
     failureReason: string | null;
     createdAt: string;
     paidAt: string | null;
+    refundRequired: boolean;
+    paymentEnvironment: PaymentEnvironmentLabel | null;
+    reviewReason: string | null;
+    duplicateOfPaymentId: string | null;
   }[];
   currentPaymentStatus: string | null;
   createdAt: string;
@@ -629,6 +715,10 @@ export function buildAdminBookingDetail(
       failureReason: p.failure_reason,
       createdAt: p.created_at.toISOString(),
       paidAt: p.paid_at ? p.paid_at.toISOString() : null,
+      refundRequired: p.refund_required === true,
+      paymentEnvironment: toPaymentEnvironment(p.payment_environment),
+      reviewReason: p.refund_required === true ? describePaymentReviewReason(p.review_reason) : null,
+      duplicateOfPaymentId: p.duplicate_of_payment_id ?? null,
     })),
     currentPaymentStatus,
     createdAt: booking.created_at.toISOString(),
@@ -667,7 +757,11 @@ export async function getAdminBookingDetail(db: DbClient, bookingId: string): Pr
 
   const { rows: payments } = await db.query<AdminPaymentAttemptRow>(
     `SELECT id, provider, provider_order_id, provider_transaction_id, amount_inr, currency,
-            payment_status, failure_reason, created_at, paid_at
+            payment_status, failure_reason, created_at, paid_at,
+            (metadata ->> 'refundRequired') = 'true' AS refund_required,
+            metadata ->> 'paymentEnvironment' AS payment_environment,
+            metadata ->> 'reason' AS review_reason,
+            duplicate_of_payment_id
      FROM payments
      WHERE booking_id = $1
      ORDER BY created_at DESC`,
@@ -742,6 +836,11 @@ interface AdminPaymentListRow {
   failure_reason: string | null;
   created_at: Date;
   paid_at: Date | null;
+  /** Typed extracts from payments.metadata (never the raw blob) — see the list query. */
+  refund_required?: boolean | null;
+  payment_environment?: string | null;
+  review_reason?: string | null;
+  duplicate_of_payment_id?: string | null;
 }
 
 export interface AdminPaymentListItem {
@@ -760,6 +859,15 @@ export interface AdminPaymentListItem {
   failureReason: string | null;
   createdAt: string;
   paidAt: string | null;
+  /** True when money was collected that support must refund manually (late payment with no
+   *  capacity, or a second payment on an already-paid booking). Never means a refund happened. */
+  refundRequired: boolean;
+  /** 'SANDBOX' marks a PhonePe test transaction (never real money); null for unmarked rows. */
+  paymentEnvironment: PaymentEnvironmentLabel | null;
+  /** Human-readable reason it needs manual attention (whitelisted wording, null unless refundRequired). */
+  reviewReason: string | null;
+  /** For a duplicate payment: the payment that actually confirmed the booking. */
+  duplicateOfPaymentId: string | null;
 }
 
 /** Deliberately never includes payments.metadata (the raw provider payload) — see this phase's
@@ -779,6 +887,10 @@ export function mapAdminPaymentListRow(row: AdminPaymentListRow): AdminPaymentLi
     failureReason: row.failure_reason,
     createdAt: row.created_at.toISOString(),
     paidAt: row.paid_at ? row.paid_at.toISOString() : null,
+    refundRequired: row.refund_required === true,
+    paymentEnvironment: toPaymentEnvironment(row.payment_environment),
+    reviewReason: row.refund_required === true ? describePaymentReviewReason(row.review_reason) : null,
+    duplicateOfPaymentId: row.duplicate_of_payment_id ?? null,
   };
 }
 
@@ -818,7 +930,11 @@ export async function listAdminPayments(db: DbClient, query: AdminPaymentsQuery)
 
   const { rows } = await db.query<AdminPaymentListRow>(
     `SELECT p.id, p.booking_id, b.booking_number, p.provider, p.provider_order_id, p.provider_transaction_id,
-            p.amount_inr, p.currency, p.payment_status, p.failure_reason, p.created_at, p.paid_at
+            p.amount_inr, p.currency, p.payment_status, p.failure_reason, p.created_at, p.paid_at,
+            (p.metadata ->> 'refundRequired') = 'true' AS refund_required,
+            p.metadata ->> 'paymentEnvironment' AS payment_environment,
+            p.metadata ->> 'reason' AS review_reason,
+            p.duplicate_of_payment_id
      FROM payments p
      JOIN bookings b ON b.id = p.booking_id
      ${whereClause}
